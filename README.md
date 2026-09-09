@@ -1,1 +1,1 @@
-# HiEditorPro
+# HiEditor Pro
