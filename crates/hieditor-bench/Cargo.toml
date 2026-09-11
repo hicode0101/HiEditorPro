@@ -1,0 +1,16 @@
+[package]
+name = "hieditor-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hieditor-core = { path = "../hieditor-core" }
+hieditor-search = { path = "../hieditor-search" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "kernel"
+harness = false

@@ -1,0 +1,9 @@
+[package]
+name = "hieditor-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hieditor-core = { path = "../hieditor-core" }
+memchr = { workspace = true }

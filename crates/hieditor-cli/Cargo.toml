@@ -1,0 +1,15 @@
+[package]
+name = "hieditor-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hieditor-cli"
+path = "src/main.rs"
+
+[dependencies]
+hieditor-core = { path = "../hieditor-core" }
+hieditor-search = { path = "../hieditor-search" }
+clap = { workspace = true }
+anyhow = { workspace = true }

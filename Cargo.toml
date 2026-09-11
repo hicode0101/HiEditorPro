@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hieditor-core",
+    "crates/hieditor-search",
+    "crates/hieditor-cli",
+    "crates/hieditor-gui",
+    "crates/hieditor-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+memmap2 = "0.9"
+memchr = "2.7"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+criterion = "0.5"
+eframe = "0.32"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
