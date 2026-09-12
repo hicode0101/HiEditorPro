@@ -15,7 +15,7 @@
 //! - 保存要求基座 Arc 独占（GUI 后台搜索持有时请另存为目标路径以外的文件或稍后重试）
 
 use crate::document::OpenOptions;
-use crate::lineindex::{ByteSource, LineIndex, Splice, DEFAULT_CHUNK};
+use crate::lineindex::{ByteSource, LineIndex, LineEnding, Splice, DEFAULT_CHUNK};
 use crate::storage::{open_backend, Encoding, StorageConfig};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -49,6 +49,11 @@ enum EditCmd {
     Insert { pos: u64, add_off: u64, len: u64 },
     /// 删除：字节快照（undo 重插，redo 重删）
     Delete { pos: u64, bytes: Vec<u8> },
+    /// 全部替换：整批一个撤销单元（piece 表前后快照）
+    ReplaceAllSnap {
+        before: (Vec<Piece>, Vec<u64>, u64),
+        after: (Vec<Piece>, Vec<u64>, u64),
+    },
 }
 
 /// 编辑结果信息（调用方/GUI 失效区间用）。
@@ -75,6 +80,8 @@ pub struct EditableBuffer {
     vlen: u64,
     /// Arc 包裹：GUI 后台搜索可持有快照引用，编辑经 make_mut 写时复制
     index: Arc<LineIndex>,
+    /// 打开时采样的行尾风格（状态栏显示用）
+    line_ending_hint: LineEnding,
     /// 打开时建索引耗时
     index_ms: u128,
     undo_stack: Vec<EditCmd>,
@@ -121,6 +128,26 @@ impl EditableBuffer {
         }
         let content_start = encoding.bom_len();
         let vlen = base.len() - content_start;
+        // 行尾风格采样（状态栏显示）
+        let (mut crlf, mut lf, mut cr) = (0u32, 0u32, 0u32);
+        for (i, &b) in head.iter().enumerate() {
+            match b {
+                b'\n' => {
+                    if i > 0 && head[i - 1] == b'\r' { crlf += 1 } else { lf += 1 }
+                }
+                b'\r' => {
+                    if i + 1 >= head.len() || head[i + 1] != b'\n' { cr += 1 }
+                }
+                _ => {}
+            }
+        }
+        let line_ending_hint = match (crlf > 0, lf > 0, cr > 0) {
+            (true, false, false) => LineEnding::Crlf,
+            (false, true, false) => LineEnding::Lf,
+            (false, false, true) => LineEnding::Cr,
+            (false, false, false) => LineEnding::None,
+            _ => LineEnding::Mixed,
+        };
         let eb = Self {
             path: path.to_path_buf(),
             base: Some(base),
@@ -135,6 +162,7 @@ impl EditableBuffer {
             cum: vec![0, vlen],
             vlen,
             index: Arc::new(LineIndex::empty()),
+            line_ending_hint,
             index_ms: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -170,6 +198,7 @@ impl EditableBuffer {
             cum: vec![0, vlen],
             vlen,
             index: Arc::new(LineIndex::empty()),
+            line_ending_hint: LineEnding::Lf,
             index_ms: 0,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -212,6 +241,11 @@ impl EditableBuffer {
     /// 建索引耗时（打开时统计，GUI 状态栏用）。
     pub fn index_build_ms(&self) -> u128 {
         self.index_ms
+    }
+
+    /// 行尾风格（打开时头部采样）。
+    pub fn line_ending_hint(&self) -> LineEnding {
+        self.line_ending_hint
     }
 
     /// 基座只读引用（零拷贝读取用）。
@@ -390,6 +424,10 @@ impl EditableBuffer {
                 self.piece_insert(pos, off, bytes.len() as u64);
                 let _ = self.index_update(pos, 0, bytes.len() as u64);
             }
+            EditCmd::ReplaceAllSnap { ref before, .. } => {
+                self.restore_state(before);
+                self.rebuild_index_full();
+            }
         }
         self.redo_stack.push(cmd);
         true
@@ -406,9 +444,93 @@ impl EditableBuffer {
                 self.piece_remove(pos, bytes.len() as u64);
                 let _ = self.index_update(pos, bytes.len() as u64, 0);
             }
+            EditCmd::ReplaceAllSnap { ref after, .. } => {
+                self.restore_state(after);
+                self.rebuild_index_full();
+            }
         }
         self.undo_stack.push(cmd);
         true
+    }
+
+    fn restore_state(&mut self, s: &(Vec<Piece>, Vec<u64>, u64)) {
+        self.pieces = s.0.clone();
+        self.cum = s.1.clone();
+        self.vlen = s.2;
+    }
+
+    fn rebuild_index_full(&mut self) {
+        if let Ok(idx) = LineIndex::build_with(self, 0, DEFAULT_CHUNK, 0) {
+            self.index = Arc::new(idx);
+        }
+    }
+
+    /// 全部替换（顺序左到右、不重叠）。整批一个撤销单元。返回替换次数。
+    pub fn replace_all(
+        &mut self,
+        needle: &[u8],
+        replacement: &[u8],
+        case_insensitive: bool,
+    ) -> usize {
+        let hits = self.find_all(needle, case_insensitive);
+        if hits.is_empty() {
+            return 0;
+        }
+        let before = (self.pieces.clone(), self.cum.clone(), self.vlen);
+        for &(pos, hlen) in hits.iter().rev() {
+            self.piece_remove(pos, hlen);
+            let off = self.add_buf.len() as u64;
+            self.add_buf.extend_from_slice(replacement);
+            self.piece_insert(pos, off, replacement.len() as u64);
+        }
+        self.dirty = true;
+        self.rebuild_index_full();
+        let after = (self.pieces.clone(), self.cum.clone(), self.vlen);
+        self.undo_stack.push(EditCmd::ReplaceAllSnap { before, after });
+        self.redo_stack.clear();
+        hits.len()
+    }
+
+    /// 全文查找全部命中（虚拟偏移, 长度；顺序左到右不重叠）。
+    pub fn find_all(&self, needle: &[u8], case_insensitive: bool) -> Vec<(u64, u64)> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let eff = if case_insensitive {
+            needle.to_ascii_lowercase()
+        } else {
+            needle.to_vec()
+        };
+        let finder = memchr::memmem::Finder::new(&eff);
+        let nlen = eff.len() as u64;
+        let win = 8 << 20;
+        let step_back = nlen.saturating_sub(1);
+        let mut out: Vec<(u64, u64)> = Vec::new();
+        let mut w = 0u64;
+        while w < self.vlen {
+            let n = win.min(self.vlen - w) as usize;
+            let mut buf = vec![0u8; n];
+            if self.read(w, &mut buf).is_err() {
+                break;
+            }
+            if case_insensitive {
+                buf.make_ascii_lowercase();
+            }
+            for rel in finder.find_iter(&buf) {
+                let abs = w + rel as u64;
+                if let Some(&(lp, ll)) = out.last() {
+                    if abs < lp + ll {
+                        continue;
+                    }
+                }
+                out.push((abs, nlen));
+            }
+            w += n as u64;
+            if step_back > 0 && w >= step_back {
+                w -= step_back; // 回退重叠区，覆盖跨窗口命中
+            }
+        }
+        out
     }
 
     // ---------- piece 表维护 ----------

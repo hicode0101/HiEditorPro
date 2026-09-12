@@ -1,105 +1,294 @@
 // release 版以窗口子系统运行（不附带控制台窗口）；debug 版保留控制台便于调试
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-//! hieditor-gui — HiEditor Pro 图形界面。
+//! hieditor-gui — HiEditor Pro 图形界面（多标签页 + 原型图布局）。
 //!
-//! - 自定义绘制行视图：只渲染可视区行（虚拟化），滚动条以"行"为单位映射，
-//!   规避超大行数下 f32 像素精度丢失
-//! - 首屏先行：open_head 挂基座后立即显示文件头部（预扫描前 1MB 行起点），
-//!   行索引进度条可见，后台建完自动切换为完整可编辑状态
-//! - 编辑：光标/选区（点击、拖拽、Shift+方向键）、字符输入、退格/删除、
-//!   Ctrl+Z/Y 撤销重做、Ctrl+S 原子保存——全部走 EditableBuffer 增量层
-//! - 搜索：后台 SearchJob 并行搜索 + 命中高亮；编辑后清空缓存（位置随内容失效）
+//! - 多 Tab：每个 Tab 独立的 EditableBuffer / 光标 / 滚动 / 搜索状态
+//! - 首屏先行：open_head 挂基座后毫秒级显示，行索引后台顺序构建，进度可见
+//! - 菜单栏（文件/编辑/搜索/查看）+ 字体工具栏 + 查找/替换面板
+//! - 编辑：光标/选区、双击选词、剪贴板（Ctrl+C/X/V/A）、右键菜单、IME 中文输入
+//! - 保存：Ctrl+S 原子替换
 
 use eframe::egui;
 use hieditor_core::document::OpenOptions;
 use hieditor_core::edit::EditableBuffer;
 use hieditor_core::lineindex::{LineIndex, LineIndexBuilder};
 use hieditor_core::util::fmt_size;
-use hieditor_search::{SearchHit, SearchJob, SearchQuery, SearchStats};
+use hieditor_search::{SearchHit, SearchJob, SearchQuery};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
 
+// ---------- 主题颜色 ----------
+// 所有界面颜色集中在 theme.rs（唯一改色入口），本文件不再出现具体色值
+mod theme;
+use theme::{editor_theme, ui as theme_ui};
+
 /// 每行渲染字节上限（超长行截断显示）
 const MAX_LINE_BYTES: usize = 80_000;
 /// GUI 搜索命中上限
 const GUI_MAX_HITS: usize = 100_000;
-/// 首屏首窗上报字节数（1MB：冷盘 ~百毫秒内出第一屏，约 1~2 万行）
+/// 首窗上报字节数（1MB：冷盘 ~百毫秒出第一屏）
 const HEAD_SCAN: u64 = 1 << 20;
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
 
-const HIGHLIGHT_BG: egui::Color32 = egui::Color32::from_rgb(180, 140, 20);
-const SELECTED_BG: egui::Color32 = egui::Color32::from_rgb(220, 90, 20);
-const SELECTION_BG: egui::Color32 = egui::Color32::from_rgb(58, 88, 150);
-const CURSOR_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
-const FG: egui::Color32 = egui::Color32::from_rgb(220, 220, 220);
-const BG: egui::Color32 = egui::Color32::from_rgb(24, 24, 28);
-const GUTTER_FG: egui::Color32 = egui::Color32::from_rgb(120, 120, 130);
+// 浅色主题（对齐原型图）
 
-/// 后台打开流程消息：Head 先到（立即可浏览首屏），
-/// Coverage 随顺序扫描增量到达（覆盖范围持续增长），
-/// Index 最后到（解锁编辑/搜索）。
+/// 后台打开流程消息（tab_id 路由到对应标签页）
 enum OpenMsg {
-    Head { eb: EditableBuffer, total: u64 },
-    Coverage {
-        starts: Arc<Vec<u64>>,
-        covered_lines: u64,
-        covered_bytes: u64,
-    },
-    Index(Box<LineIndex>),
-    Error(String),
+    Head { tab_id: u64, eb: EditableBuffer, total: u64 },
+    Coverage { tab_id: u64, starts: Arc<Vec<u64>>, covered_lines: u64, covered_bytes: u64 },
+    Index { tab_id: u64, idx: Box<LineIndex> },
+    Error { tab_id: u64, msg: String },
 }
 
-fn main() -> eframe::Result<()> {
-    let path = std::env::args().nth(1).map(PathBuf::from);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_title("HiEditor Pro"),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "HiEditor Pro",
-        options,
-        Box::new(move |cc| {
-            install_cjk_font(&cc.egui_ctx);
-            Ok(Box::new(App::new(path)))
-        }),
-    )
+/// 编辑字体候选（显示名, 字体文件；空串 = egui 默认等宽）
+
+// ---------- 国际化 ----------
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Follow,
+    Zh,
+    En,
 }
 
-/// 注册 Windows 中文字体（egui 默认字体无 CJK 字形）。
-/// 只尝试单面 .ttf（ab_glyph 不支持 .ttc 集合）；找不到则静默跳过。
-fn install_cjk_font(ctx: &egui::Context) {
-    const CANDIDATES: &[&str] = &[
-        "C:\\Windows\\Fonts\\simhei.ttf",
-        "C:\\Windows\\Fonts\\Deng.ttf",
-        "C:\\Windows\\Fonts\\simfang.ttf",
-    ];
-    for p in CANDIDATES {
-        if let Ok(data) = std::fs::read(p) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), Arc::new(egui::FontData::from_owned(data)));
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts.families.entry(family).or_default().push("cjk".to_owned());
-            }
-            ctx.set_fonts(fonts);
-            return;
+impl Lang {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "zh" => Lang::Zh,
+            "en" => Lang::En,
+            _ => Lang::Follow,
+        }
+    }
+    fn save_key(&self) -> &'static str {
+        match self {
+            Lang::Zh => "zh",
+            Lang::En => "en",
+            Lang::Follow => "follow",
+        }
+    }
+    fn is_zh(self) -> bool {
+        match self {
+            Lang::Zh => true,
+            Lang::En => false,
+            Lang::Follow => sys_locale::get_locale()
+                .map(|l| l.to_ascii_lowercase().starts_with("zh"))
+                .unwrap_or(false),
         }
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemeMode {
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "dark" => ThemeMode::Dark,
+            _ => ThemeMode::Light,
+        }
+    }
+    fn save_key(&self) -> &'static str {
+        match self {
+            ThemeMode::Dark => "dark",
+            ThemeMode::Light => "light",
+        }
+    }
+}
+
+/// 界面文案（zh/en 双语，未命中回退英语）。
+fn tr(lang: Lang, key: &str) -> &'static str {
+    let zh = lang.is_zh();
+    match (zh, key) {
+        (_, "menu.file") => if zh { "文件" } else { "File" },
+        (_, "menu.edit") => if zh { "编辑" } else { "Edit" },
+        (_, "menu.search") => if zh { "搜索" } else { "Search" },
+        (_, "menu.view") => if zh { "查看" } else { "View" },
+        (_, "menu.about") => if zh { "关于" } else { "About" },
+        (_, "file.open") => if zh { "打开…" } else { "Open…" },
+        (_, "file.save") => if zh { "保存" } else { "Save" },
+        (_, "file.settings") => if zh { "设置" } else { "Settings" },
+        (_, "file.exit") => if zh { "退出" } else { "Exit" },
+        (_, "edit.undo") => if zh { "撤销" } else { "Undo" },
+        (_, "edit.redo") => if zh { "恢复" } else { "Redo" },
+        (_, "edit.selectall") => if zh { "全选" } else { "Select All" },
+        (_, "edit.cut") => if zh { "剪切" } else { "Cut" },
+        (_, "edit.copy") => if zh { "复制" } else { "Copy" },
+        (_, "edit.paste") => if zh { "粘贴" } else { "Paste" },
+        (_, "edit.delete") => if zh { "删除" } else { "Delete" },
+        (_, "search.find") => if zh { "查找" } else { "Find" },
+        (_, "search.findreplace") => if zh { "查找并替换" } else { "Find & Replace" },
+        (_, "search.label") => if zh { "查找" } else { "Find" },
+        (_, "search.next") => if zh { "下一个" } else { "Next" },
+        (_, "search.prev") => if zh { "上一个" } else { "Previous" },
+        (_, "search.all") => if zh { "全部" } else { "All" },
+        (_, "search.case") => if zh { "区分大小写" } else { "Match case" },
+        (_, "search.word") => if zh { "全词匹配" } else { "Whole word" },
+        (_, "search.regex") => if zh { "正则" } else { "Regex" },
+        (_, "search.regex_pending") => if zh { "正则搜索将在后续版本提供" } else { "Regex search coming soon" },
+        (_, "search.replace") => if zh { "替换" } else { "Replace" },
+        (_, "search.replaceall") => if zh { "全部替换" } else { "Replace All" },
+        (_, "search.findhint") => if zh { "输入查找内容回车" } else { "Find, Enter to search" },
+        (_, "search.replacehint") => if zh { "输入替换内容" } else { "Replacement" },
+        (_, "view.wrap") => if zh { "自动换行" } else { "Wrap lines" },
+        (_, "toolbar.font") => if zh { "字体" } else { "Font" },
+        (_, "toolbar.size") => if zh { "字号" } else { "Size" },
+        (_, "font.default") => if zh { "默认字体" } else { "Default font" },
+        (_, "tab.new") => if zh { "新建标签页" } else { "New Tab" },
+        (_, "tab.close") => if zh { "关闭" } else { "Close" },
+        (_, "tab.untitled") => if zh { "无标题" } else { "Untitled" },
+        (_, "settings.title") => if zh { "设置" } else { "Settings" },
+        (_, "settings.lang") => if zh { "界面语言" } else { "Language" },
+        (_, "settings.theme") => if zh { "主题风格" } else { "Theme" },
+        (_, "lang.follow") => if zh { "跟随系统" } else { "Follow system" },
+        (_, "lang.zh") => if zh { "简体中文" } else { "Simplified Chinese" },
+        (_, "lang.en") => if zh { "英语" } else { "English" },
+        (_, "theme.light") => if zh { "浅色模式" } else { "Light" },
+        (_, "theme.dark") => if zh { "深色模式" } else { "Dark" },
+        (_, "settings.shortcut") => if zh { "创建桌面快捷方式" } else { "Create desktop shortcut" },
+        (_, "settings.shortcut_ok") => if zh { "桌面快捷方式已创建" } else { "Desktop shortcut created" },
+        (_, "settings.shortcut_fail") => if zh { "创建桌面快捷方式失败" } else { "Failed to create shortcut" },
+        (_, "about.title") => if zh { "关于" } else { "About" },
+        (_, "about.src") => if zh { "开源地址" } else { "Source" },
+        (_, "about.wx") => if zh { "作者微信" } else { "Author WeChat" },
+        (_, "btn.open") => if zh { "打开" } else { "Open" },
+        (_, "btn.copy") => if zh { "复制" } else { "Copy" },
+        (_, "btn.copywx") => if zh { "复制微信号" } else { "Copy WeChat ID" },
+        (_, "status.copied") => if zh { "已复制" } else { "Copied" },
+        (_, "status.loading") => if zh { "读取…" } else { "Reading…" },
+        (_, "status.indexing") => if zh { "建索引中" } else { "Building index" },
+        (_, "status.ready") => if zh { "索引就绪" } else { "Index ready" },
+        (_, "status.editable") => if zh { "可编辑/搜索" } else { "editing & search unlocked" },
+        (_, "status.browseable") => if zh { "行可浏览" } else { "lines browsable" },
+        (_, "status.searchdone") => if zh { "搜索完成: 命中" } else { "Search done: hits" },
+        (_, "status.searching") => if zh { "搜索中…" } else { "Searching…" },
+        (_, "status.copiedn") => if zh { "已复制" } else { "Copied" },
+        (_, "status.cutn") => if zh { "已剪切" } else { "Cut" },
+        (_, "status.clipempty") => if zh { "剪贴板为空或不可用" } else { "Clipboard empty or unavailable" },
+        (_, "status.replaced1") => if zh { "已替换 1 处" } else { "Replaced 1 occurrence" },
+        (_, "status.replaceall") => if zh { "全部替换完成（Ctrl+Z 可整批撤销）" } else { "Replace all done (Ctrl+Z to undo)" },
+        (_, "status.wordall") => if zh { "全词匹配暂不支持全部替换" } else { "Whole-word Replace All not supported yet" },
+        (_, "status.savefail") => if zh { "保存失败" } else { "Save failed" },
+        (_, "status.saved") => if zh { "已保存" } else { "Saved" },
+        (_, "status.untitlednosave") => if zh { "无标题文档尚未关联文件，请先打开一个文件" } else { "Untitled document has no file yet" },
+        (_, "status.openfailed") => if zh { "打开失败" } else { "Open failed" },
+        (_, "file.new_tab") => if zh { "新建标签页" } else { "New Tab" },
+        (_, "file.new_window") => if zh { "新建窗口" } else { "New Window" },
+        (_, "file.open_recent") => if zh { "打开最近所用文件" } else { "Open Recent" },
+        (_, "file.save_all") => if zh { "全部保存" } else { "Save All" },
+        (_, "file.print") => if zh { "打印…" } else { "Print…" },
+        (_, "file.close_tab") => if zh { "关闭标签页" } else { "Close Tab" },
+        (_, "file.close_window") => if zh { "关闭窗口" } else { "Close Window" },
+        (_, "status.saveall_done") => if zh { "全部保存完成" } else { "All tabs saved" },
+        (_, "status.reading") => if zh { "读取…" } else { "Reading…" },
+        (_, "editor.truncated") => if zh { " …截断" } else { " …truncated" },
+        (_, "editor.indexing") => if zh { "行索引构建中 {}%（顺序读盘）— 内容随加载可浏览，完成后可编辑与搜索" } else { "Building line index {}% (sequential read) — content browsable while loading; edit & search unlock when done" },
+        (_, "confirm.title") => if zh { "关闭前保存？" } else { "Save before closing?" },
+        (_, "confirm.msg") => if zh { "有未保存的修改。" } else { "has unsaved changes." },
+        (_, "confirm.save") => if zh { "保存并关闭" } else { "Save & Close" },
+        (_, "confirm.nosave") => if zh { "不保存" } else { "Don't Save" },
+        (_, "confirm.cancel") => if zh { "取消" } else { "Cancel" },
+        (_, "drop.hint") => if zh { "松开以在新标签页打开文件" } else { "Drop to open in a new tab" },
+        (_, "status.line") => if zh { "行" } else { "Ln" },
+        (_, "status.col") => if zh { "列" } else { "Col" },
+        (_, "status.total") => if zh { "共" } else { "Total" },
+        (_, "status.lines") => if zh { "行" } else { "lines" },
+        (_, "status.unsaved") => if zh { "● 未保存" } else { "● Unsaved" },
+        (_, "empty.heading") => if zh { "HiEditor Pro" } else { "HiEditor Pro" },
+        (_, "empty.hint1") => if zh { "拖入文件、点标签栏 ＋ 新建，或在文件框输入路径" } else { "Drop a file, click ＋ in the tab bar, or type a path above" },
+        (_, "settings.saved") => if zh { "设置已保存" } else { "Settings saved" },
+        (_, "search.menufind") => if zh { "查找（Ctrl+F）" } else { "Find (Ctrl+F)" },
+        (_, "tab.close_menu") => if zh { "关闭选项卡" } else { "Close Tab" },
+        (_, "tab.close_others") => if zh { "关闭其它选项卡" } else { "Close Other Tabs" },
+        (_, "tab.close_others_hint") => if zh { "其它标签页有未保存的修改" } else { "Other tabs have unsaved changes" },
+        (_, "file.saveas") => if zh { "另存为…" } else { "Save As…" },
+        (_, "status.comingsoon") => if zh { "即将支持" } else { "Coming soon" },
+        (_, "tab.openfolder") => if zh { "打开所在文件夹" } else { "Open Containing Folder" },
+        (_, "tab.copydir") => if zh { "复制当前目录路径" } else { "Copy Folder Path" },
+        (_, "tab.copyfile") => if zh { "复制当前文件路径" } else { "Copy File Path" },        (_, "search.menufr") => if zh { "查找并替换（Ctrl+H）" } else { "Find & Replace (Ctrl+H)" },        (_, "edit.upper") => if zh { "转大写" } else { "UPPERCASE" },        (_, "edit.lower") => if zh { "转小写" } else { "lowercase" },        (_, "edit.title") => if zh { "首字母大写其余小写" } else { "Title Case" },        (_, "status.opened") => if zh { "已打开" } else { "Opened" },        (_, "status.replaced_all") => if zh { "全部替换完成（Ctrl+Z 可整批撤销）" } else { "Replace all done (Ctrl+Z to undo)" },        (_, "status.indexed") => if zh { "已索引" } else { "Indexed" },        (_, "status.editwhen") => if zh { "索引完成后可编辑/搜索" } else { "edit & search unlock when done" },        (_, "about.desc") => if zh { "Win平台大文本快速编辑工具，秒开GB级以上文件" } else { "Windows platform large text editing tool, opens files larger than GB in seconds." },        _ => "",
+    }
+}
+
+/// 带占位符的文案：按顺序替换 {}
+fn trf(lang: Lang, key: &str, args: &[&str]) -> String {
+    let mut s = tr(lang, key).to_string();
+    for a in args {
+        s = s.replacen("{}", a, 1);
+    }
+    s
+}
+
+// ---------- 设置持久化 ----------
+fn conf_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+        .map(|d| d.join("hieditor.conf"))
+}
+
+fn load_settings() -> (Lang, ThemeMode) {
+    let mut lang = Lang::Follow;
+    let mut theme = ThemeMode::Light;
+    if let Some(p) = conf_path() {
+        if let Ok(text) = std::fs::read_to_string(p) {
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("language=") {
+                    lang = Lang::from_str(v.trim());
+                }
+                if let Some(v) = line.strip_prefix("theme=") {
+                    theme = ThemeMode::from_str(v.trim());
+                }
+            }
+        }
+    }
+    (lang, theme)
+}
+
+fn save_settings(lang: Lang, theme: ThemeMode) {
+    if let Some(p) = conf_path() {
+        let _ = std::fs::write(
+            p,
+            format!("language={}\ntheme={}\n", lang.save_key(), theme.save_key()),
+        );
+    }
+}
+
+fn create_desktop_shortcut() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    let script = format!(
+        "$ws = New-Object -ComObject WScript.Shell; $lnk = $ws.CreateShortcut((New-Object -ComObject Shell.Application).NameSpace(0).Self.Path + '\\HiEditor Pro.lnk'); $lnk.TargetPath = '{}'; $lnk.WorkingDirectory = '{}'; $lnk.IconLocation = '{}'; $lnk.Save()",
+        exe.display(),
+        dir.display(),
+        exe.display()
+    );
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+
+const FONT_CHOICES: &[(&str, &str)] = &[
+    ("默认字体", ""),
+    ("Consolas", "C:\\Windows\\Fonts\\consola.ttf"),
+    ("黑体", "C:\\Windows\\Fonts\\simhei.ttf"),
+    ("等线", "C:\\Windows\\Fonts\\Deng.ttf"),
+];
+
 struct SearchUi {
     input: String,
     case_sensitive: bool,
+    whole_word: bool,
     job: Option<SearchJob>,
-    /// 已完成搜索的排序命中快照（Arc，渲染零拷贝）
     hits: Arc<Vec<SearchHit>>,
-    stats: Option<SearchStats>,
     selected: usize,
 }
 
@@ -108,141 +297,455 @@ impl Default for SearchUi {
         Self {
             input: String::new(),
             case_sensitive: false,
+            whole_word: false,
             job: None,
             hits: Arc::new(Vec::new()),
-            stats: None,
             selected: 0,
         }
     }
 }
 
-struct App {
-    eb: Option<EditableBuffer>,
-    open_rx: Option<Receiver<OpenMsg>>,
-    open_error: Option<String>,
-    path_input: String,
-    first_line: u64,
-    font_size: f32,
-    /// 最近一帧可视行数（命中导航/翻页用）
-    last_visible: u64,
+/// 一个标签页：独立的文档缓冲与视图状态。
+struct Tab {
+    id: u64,
+    eb: EditableBuffer,
     /// 光标（虚拟字节偏移）
     cursor: u64,
-    /// 选区锚点（None = 无选区）
+    /// 选区锚点
     anchor: Option<u64>,
-    /// 编辑区是否持有键盘焦点（搜索/路径输入框聚焦时为 false）
-    editor_focused: bool,
-    /// 索引未就绪时的已扫描行起点（虚拟坐标，随顺序扫描增长）
-    load_starts: Vec<u64>,
-    /// 已覆盖行数（含第 0 行）
-    covered_lines: u64,
-    /// 已覆盖字节数
-    covered_bytes: u64,
-    /// 加载目标总字节数（虚拟内容长）
-    load_total: u64,
-    /// 取消当前加载（重新打开时置位）
-    load_cancel: Arc<AtomicBool>,
-    /// 自动换行显示
-    wrap: bool,
-    /// 换行模式下首行顶部被滚过的视觉行数
+    /// 最近一帧可视行数
+    last_visible: u64,
+    first_line: u64,
     wrap_skip: u64,
-    /// 换行模式下各逻辑行的视觉行数缓存（键 = 行号；编辑/宽度变化时清空）
-    wrap_rows: std::collections::HashMap<u64, u32>,
-    /// 上次换行排版的文本区宽度（变化即缓存失效）
-    last_wrap_w: f32,
-    /// 水平滚动偏移（内容像素；仅非换行模式）
     h_scroll: f32,
-    /// 可见行中的最大文本宽度（水平滚动范围依据，逐帧更新）
     h_extent: f32,
-    /// 上一帧光标位置（仅光标移动时做滚动跟随，避免滚轮被光标拉回）
     last_cursor: u64,
+    wrap_rows: HashMap<u64, u32>,
+    last_wrap_w: f32,
+    load_starts: Vec<u64>,
+    covered_lines: u64,
+    covered_bytes: u64,
+    load_total: u64,
     search: SearchUi,
-    status: String,
+    replace_input: String,
 }
 
-impl App {
-    fn new(path: Option<PathBuf>) -> Self {
-        let mut app = Self {
-            eb: None,
-            open_rx: None,
-            open_error: None,
-            path_input: path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            first_line: 0,
-            font_size: 15.0,
-            last_visible: 40,
+impl Tab {
+    fn new(id: u64, eb: EditableBuffer) -> Self {
+        Self {
+            id,
+            eb,
             cursor: 0,
             anchor: None,
-            editor_focused: false,
+            last_visible: 40,
+            first_line: 0,
+            wrap_skip: 0,
+            h_scroll: 0.0,
+            h_extent: 0.0,
+            last_cursor: 0,
+            wrap_rows: HashMap::new(),
+            last_wrap_w: 0.0,
             load_starts: vec![0],
             covered_lines: 1,
             covered_bytes: 0,
             load_total: 0,
-            load_cancel: Arc::new(AtomicBool::new(false)),
-            wrap: false,
-            wrap_skip: 0,
-            wrap_rows: std::collections::HashMap::new(),
-            last_wrap_w: 0.0,
-            h_scroll: 0.0,
-            h_extent: 0.0,
-            last_cursor: 0,
             search: SearchUi::default(),
-            status: String::new(),
+            replace_input: String::new(),
+        }
+    }
+
+    fn new_empty(id: u64) -> Self {
+        Self::new(id, EditableBuffer::from_vec(Vec::new()))
+    }
+
+    fn title(&self) -> String {
+        let name = self
+            .eb
+            .path()
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "无标题".into());
+        if self.is_loading() {
+            format!("{name} ⏳")
+        } else {
+            name
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        !self.eb.has_index()
+    }
+
+    fn sel_range(&self) -> Option<(u64, u64)> {
+        let a = self.anchor?;
+        let (s, e) = (a.min(self.cursor), a.max(self.cursor));
+        (s < e).then_some((s, e))
+    }
+
+    fn invalidate_search(&mut self) {
+        if let Some(job) = self.search.job.take() {
+            job.cancel();
+        }
+        self.search.hits = Arc::new(Vec::new());
+        self.search.selected = 0;
+        self.wrap_rows.clear();
+    }
+
+    fn scroll_to_cursor(&mut self) {
+        if !self.eb.has_index() {
+            return;
+        }
+        let line = self.eb.line_of_offset(self.cursor);
+        if line < self.first_line || line >= self.first_line + self.last_visible {
+            self.first_line = line.saturating_sub(self.last_visible / 4);
+            self.wrap_skip = 0;
+        }
+    }
+
+    // ---------- 编辑动作（状态信息由调用方显示）----------
+
+    fn insert_text(&mut self, s: &str) {
+        let range = self.sel_range();
+        let pos = range.map(|(st, _)| st).unwrap_or(self.cursor);
+        if let Some((_, en)) = range {
+            let _ = self.eb.delete(pos, en - pos);
+        }
+        if self.eb.insert(pos, s.as_bytes()).is_ok() {
+            self.cursor = pos + s.len() as u64;
+            self.anchor = None;
+            self.invalidate_search();
+        }
+        self.scroll_to_cursor();
+    }
+
+    fn delete_at_cursor(&mut self, forward: bool) {
+        let range = self.sel_range();
+        let cursor = self.cursor;
+        if let Some((st, en)) = range {
+            let _ = self.eb.delete(st, en - st);
+            self.cursor = st;
+        } else if forward {
+            if cursor < self.eb.len() {
+                let end = next_boundary(&self.eb, cursor);
+                let _ = self.eb.delete(cursor, end - cursor);
+            }
+        } else if cursor > 0 {
+            let start = prev_boundary(&self.eb, cursor);
+            let _ = self.eb.delete(start, cursor - start);
+            self.cursor = start;
+        } else {
+            return;
+        }
+        self.anchor = None;
+        self.invalidate_search();
+        self.scroll_to_cursor();
+    }
+
+    fn move_cursor(&mut self, new: u64, extend: bool) {
+        if extend && self.anchor.is_none() {
+            self.anchor = Some(self.cursor);
+        }
+        self.cursor = new;
+        if !extend {
+            self.anchor = None;
+        }
+        self.scroll_to_cursor();
+    }
+
+    fn move_line(&mut self, delta: i64, extend: bool) {
+        let cur_line = self.eb.line_of_offset(self.cursor);
+        let col = self.cursor - self.eb.start_of_line(cur_line);
+        let n = self.eb.line_count();
+        let new_line = (cur_line as i64 + delta).clamp(0, n as i64 - 1) as u64;
+        let ls = self.eb.start_of_line(new_line);
+        let le = self.eb.line_bounds(new_line).1;
+        self.move_cursor((ls + col).min(le), extend);
+    }
+
+    fn do_undo(&mut self) {
+        if self.eb.undo() {
+            self.cursor = self.cursor.min(self.eb.len());
+            self.anchor = None;
+            self.invalidate_search();
+        }
+        self.scroll_to_cursor();
+    }
+
+    fn do_redo(&mut self) {
+        if self.eb.redo() {
+            self.cursor = self.cursor.min(self.eb.len());
+            self.anchor = None;
+            self.invalidate_search();
+        }
+        self.scroll_to_cursor();
+    }
+
+    fn copy_selection(&mut self) -> Option<usize> {
+        let (st, en) = self.sel_range()?;
+        let len = (en - st) as usize;
+        let mut buf = vec![0u8; len];
+        self.eb.read(st, &mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if !clipboard_set(&text) {
+            return None;
+        }
+        Some(text.chars().count())
+    }
+
+    fn cut_selection(&mut self) -> Option<usize> {
+        let (st, en) = self.sel_range()?;
+        let len = (en - st) as usize;
+        let mut buf = vec![0u8; len];
+        self.eb.read(st, &mut buf).ok()?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if !clipboard_set(&text) {
+            return None;
+        }
+        let _ = self.eb.delete(st, en - st);
+        self.cursor = st;
+        self.anchor = None;
+        self.invalidate_search();
+        Some(text.chars().count())
+    }
+
+    fn delete_selection(&mut self) {
+        if let Some((st, en)) = self.sel_range() {
+            let _ = self.eb.delete(st, en - st);
+            self.cursor = st;
+            self.anchor = None;
+            self.invalidate_search();
+        }
+    }
+
+    fn transform_selection(&mut self, mode: CaseMode) {
+        if let Some((st, en)) = self.sel_range() {
+            let len = (en - st) as usize;
+            let mut buf = vec![0u8; len];
+            if self.eb.read(st, &mut buf).is_err() {
+                return;
+            }
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            let transformed = match mode {
+                CaseMode::Upper => text.to_uppercase(),
+                CaseMode::Lower => text.to_lowercase(),
+                CaseMode::Title => title_case(&text),
+            };
+            let _ = self.eb.replace(st, en - st, transformed.as_bytes());
+            self.cursor = st + transformed.len() as u64;
+            self.anchor = None;
+            self.invalidate_search();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CaseMode {
+    Upper,
+    Lower,
+    Title,
+}
+
+/// 首字母大写其余小写（按空白分词）
+fn title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            out.push(c);
+            at_word_start = true;
+        } else if at_word_start {
+            out.extend(c.to_uppercase());
+            at_word_start = false;
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+fn clipboard_get() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()?
+        .get_text()
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn clipboard_set(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut c| c.set_text(text.to_owned()).ok())
+        .is_some()
+}
+
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+struct App {
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab_id: u64,
+    open_rx: Option<Receiver<OpenMsg>>,
+    load_cancels: HashMap<u64, Arc<AtomicBool>>,
+    open_error: Option<String>,
+    path_input: String,
+    focus_path: bool,
+    font_size: f32,
+    font_name: String,
+    wrap: bool,
+    show_find: bool,
+    show_replace: bool,
+    show_settings: bool,
+    show_about: bool,
+    lang: Lang,
+    theme_mode: ThemeMode,
+    editor_focused: bool,
+    /// 上一帧各标签页矩形（id, rect），供拖拽命中测试
+    tab_rects: Vec<(u64, egui::Rect)>,
+    /// 本帧指针 x（渲染时记录）
+    pointer_x: f32,
+    recent_files: Vec<PathBuf>,
+    confirm_close: Option<usize>,
+    status: String,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let (lang, theme_mode) = load_settings();
+        cc.egui_ctx.set_visuals(match theme_mode {
+            ThemeMode::Light => egui::Visuals::light(),
+            ThemeMode::Dark => egui::Visuals::dark(),
+        });
+        let mut app = Self {
+            tabs: Vec::new(),
+            active: 0,
+            next_tab_id: 1,
+            open_rx: None,
+            load_cancels: HashMap::new(),
+            open_error: None,
+            path_input: String::new(),
+            focus_path: false,
+            font_size: 15.0,
+            font_name: "默认字体".into(),
+            wrap: false,
+            show_find: false,
+            show_replace: false,
+            show_settings: false,
+            show_about: false,
+            lang,
+            theme_mode,
+            editor_focused: false,
+            tab_rects: Vec::new(),
+            pointer_x: 0.0,
+            recent_files: load_recent_files(),
+            confirm_close: None,
+            status: tr(lang, "empty.hint1").into(),
         };
-        if let Some(p) = path {
-            app.request_open(p);
+        if let Some(p) = std::env::args().nth(1) {
+            app.path_input = p.clone();
+            app.request_open(PathBuf::from(p));
         }
         app
     }
 
+    fn active_mut(&mut self) -> Option<&mut Tab> {
+        self.tabs.get_mut(self.active)
+    }
+
+    fn is_loading(&self) -> bool {
+        self.tabs.get(self.active).map(|t| t.is_loading()).unwrap_or(false)
+    }
+
+    /// 取出当前标签页（渲染期间独占，结束后放回）
+    fn new_tab(&mut self) {
+        let t = Tab::new_empty(self.next_tab_id);
+        self.next_tab_id += 1;
+        self.tabs.push(t);
+        self.active = self.tabs.len() - 1;
+    }
+
+    fn save_all_dirty(&mut self) -> usize {
+        let mut saved = 0;
+        for t in self.tabs.iter_mut() {
+            if t.eb.is_dirty() && !t.eb.path().as_os_str().is_empty() {
+                if t.eb.save().is_ok() {
+                    saved += 1;
+                }
+            }
+        }
+        saved
+    }
+
+    fn close_active_tab(&mut self) {
+        let idx = self.active;
+        self.close_tab(idx);
+    }
+
+    fn eb_take_active(&mut self) -> Option<Tab> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let idx = self.active.min(self.tabs.len() - 1);
+        Some(self.tabs.remove(idx))
+    }
+
+    fn eb_put_back(&mut self, tab: Tab) {
+        let idx = self.active.min(self.tabs.len());
+        self.tabs.insert(idx, tab);
+    }
+
     fn request_open(&mut self, path: PathBuf) {
+        let lang = self.lang;
         // 终止上一个仍在进行的加载
-        self.load_cancel.store(true, Ordering::Relaxed);
+        for c in self.load_cancels.values() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.load_cancels.clear();
+
+        // 记录到最近文件列表
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !self.recent_files.contains(&canon) {
+            self.recent_files.insert(0, canon.clone());
+            if self.recent_files.len() > 20 {
+                self.recent_files.truncate(20);
+            }
+        } else if let Some(pos) = self.recent_files.iter().position(|p| *p == canon) {
+            let f = self.recent_files.remove(pos);
+            self.recent_files.insert(0, f);
+        }
+        // 持久化到磁盘
+        save_recent_files(&self.recent_files);
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
         let cancel = Arc::new(AtomicBool::new(false));
-        self.load_cancel = Arc::clone(&cancel);
+        self.load_cancels.insert(id, Arc::clone(&cancel));
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.open_rx = Some(rx);
-        self.eb = None;
         self.open_error = None;
-        self.status = "读取文件…".into();
-        self.search = SearchUi::default();
-        self.first_line = 0;
-        self.cursor = 0;
-        self.anchor = None;
-        self.load_starts = vec![0];
-        self.covered_lines = 1;
-        self.covered_bytes = 0;
-        self.wrap_skip = 0;
-        self.wrap_rows.clear();
-        self.h_scroll = 0.0;
-        self.h_extent = 0.0;
-        self.last_cursor = 0;
+        self.status = format!("{} {}", tr(lang, "status.reading"), path.display());
         std::thread::spawn(move || {
-            // 阶段一：挂基座（mmap 瞬时完成），先送回首屏
             let eb = match EditableBuffer::open_head(&path, &OpenOptions::default()) {
                 Ok(e) => e,
                 Err(e) => {
-                    let _ = tx.send(OpenMsg::Error(e.to_string()));
+                    let _ = tx.send(OpenMsg::Error { tab_id: id, msg: e.to_string() });
                     return;
                 }
             };
             let bom = eb.encoding().bom_len();
             let vlen = eb.len().saturating_sub(bom);
-            let base = eb.base_arc(); // eb move 进消息前克隆，供扫描使用
-            let _ = tx.send(OpenMsg::Head { eb, total: vlen });
+            let base = eb.base_arc();
+            let _ = tx.send(OpenMsg::Head { tab_id: id, eb, total: vlen });
             let Some(base) = base else { return };
 
-            // 阶段二：顺序读盘 + 渐进建索引（机械盘最优 I/O 模式；
-            // 覆盖范围随扫描增长，已覆盖部分立即可浏览）
+            // 顺序读盘 + 渐进建索引（机械盘最优 I/O 模式）
             let mut builder = LineIndexBuilder::new(bom);
             let win = 16 << 20;
             let mut buf = vec![0u8; win as usize];
-            let mut covered = 0u64; // 虚拟坐标
-            let mut win_starts: Vec<u64> = Vec::new(); // 本窗口行起点（builder 只消费一次）
-            let mut pending_gui: Vec<u64> = Vec::new(); // 待上报 GUI 的行起点（跨窗累积）
-            // 首窗仅 1MB：内容百毫秒级可见（EmEditor 同款体验），此后约每 64MB 增量上报
+            let mut covered = 0u64;
+            let mut win_starts: Vec<u64> = Vec::new();
+            let mut pending_gui: Vec<u64> = Vec::new();
             let mut next_report = HEAD_SCAN;
             while covered < vlen {
                 if cancel.load(Ordering::Relaxed) {
@@ -251,7 +754,7 @@ impl App {
                 let wsize = if covered == 0 { HEAD_SCAN } else { win };
                 let n = wsize.min(vlen - covered) as usize;
                 if let Err(e) = base.read_range(bom + covered, n, &mut buf[..n]) {
-                    let _ = tx.send(OpenMsg::Error(e.to_string()));
+                    let _ = tx.send(OpenMsg::Error { tab_id: id, msg: e.to_string() });
                     return;
                 }
                 for rel in memchr::memchr_iter(b'\n', &buf[..n]) {
@@ -264,9 +767,8 @@ impl App {
                 builder.push_line_starts(&win_starts);
                 pending_gui.append(&mut win_starts);
                 if covered >= next_report || covered == vlen {
-                    // builder 与 GUI 是两个独立消费者：起点各消费恰好一次；
-                    // 未上报的累积在 pending_gui 随下次一并发出（不可丢弃，否则错位）
                     let _ = tx.send(OpenMsg::Coverage {
+                        tab_id: id,
                         starts: Arc::new(std::mem::take(&mut pending_gui)),
                         covered_lines: builder.covered_lines(),
                         covered_bytes: covered,
@@ -274,219 +776,125 @@ impl App {
                     next_report = covered + (64 << 20).max(covered / 10);
                 }
             }
-            let _ = tx.send(OpenMsg::Index(Box::new(builder.finish(vlen))));
+            let _ = tx.send(OpenMsg::Index { tab_id: id, idx: Box::new(builder.finish(vlen)) });
         });
     }
 
     fn start_search(&mut self) {
-        let Some(eb) = self.eb.as_ref() else { return };
-        if !eb.has_index() {
+        let Some(tab) = self.active_mut() else { return };
+        if !tab.eb.has_index() {
             self.status = "行索引构建中，完成后可搜索".into();
             return;
         }
-        if self.search.input.is_empty() {
+        if tab.search.input.is_empty() {
             return;
         }
-        if let Some(job) = &self.search.job {
+        if let Some(job) = &tab.search.job {
             job.cancel();
         }
-        let query =
-            SearchQuery::new(self.search.input.as_bytes().to_vec(), self.search.case_sensitive);
-        let Some(base) = eb.base_arc() else { return };
-        match SearchJob::start(base, eb.index_arc(), query, GUI_MAX_HITS, 0) {
+        let query = SearchQuery::new(
+            tab.search.input.as_bytes().to_vec(),
+            tab.search.case_sensitive,
+        );
+        let Some(base) = tab.eb.base_arc() else { return };
+        match SearchJob::start(base, tab.eb.index_arc(), query, GUI_MAX_HITS, 0) {
             Ok(job) => {
-                self.search.hits = Arc::new(Vec::new());
-                self.search.stats = None;
-                self.search.selected = 0;
-                self.search.job = Some(job);
+                tab.search.hits = Arc::new(Vec::new());
+                tab.search.selected = 0;
+                tab.search.job = Some(job);
             }
             Err(e) => self.status = format!("搜索失败: {e}"),
         }
     }
 
-    fn goto_hit(&mut self, visible: u64) {
-        if let Some(h) = self.search.hits.get(self.search.selected) {
-            self.first_line = h.line.saturating_sub(visible / 4);
-        }
-    }
-
-    // ---------- 编辑辅助（eb 由调用方传入：update() 中已从 self.eb take 出来）----------
-
-    fn sel_range(&self) -> Option<(u64, u64)> {
-        let a = self.anchor?;
-        let (s, e) = (a.min(self.cursor), a.max(self.cursor));
-        (s < e).then_some((s, e))
-    }
-
-    /// 编辑使搜索结果失效（命中位置随内容漂移）。
-    fn invalidate_search(&mut self) {
-        if let Some(job) = self.search.job.take() {
-            job.cancel();
-        }
-        self.search.hits = Arc::new(Vec::new());
-        self.search.stats = None;
-        self.search.selected = 0;
-        // 内容已变化：换行行数缓存全部失效（所有编辑/撤销路径都会经过这里）
-        self.wrap_rows.clear();
-    }
-
-    fn scroll_to_cursor(&mut self, eb: &EditableBuffer) {
-        if !eb.has_index() {
+    fn goto_hit(&mut self, delta: i64) {
+        let Some(tab) = self.active_mut() else { return };
+        let total = tab.search.hits.len() as i64;
+        if total == 0 {
             return;
         }
-        let line = eb.line_of_offset(self.cursor);
-        if line < self.first_line || line >= self.first_line + self.last_visible {
-            self.first_line = line.saturating_sub(self.last_visible / 4);
-            self.wrap_skip = 0;
-        }
+        tab.search.selected =
+            ((tab.search.selected as i64 + delta).rem_euclid(total)) as usize;
+        let line = tab.search.hits[tab.search.selected].line;
+        tab.first_line = line.saturating_sub(tab.last_visible / 4);
+        tab.wrap_skip = 0;
     }
 
-    fn insert_text(&mut self, eb: &mut EditableBuffer, s: &str) {
-        let range = self.sel_range();
-        let pos = range.map(|(st, _)| st).unwrap_or(self.cursor);
-        if let Some((_, en)) = range {
-            let _ = eb.delete(pos, en - pos);
-        }
-        if eb.insert(pos, s.as_bytes()).is_ok() {
-            self.cursor = pos + s.len() as u64;
-            self.anchor = None;
-            self.invalidate_search();
-        }
-        self.scroll_to_cursor(eb);
+    fn replace_current(&mut self) {
+        let lang = self.lang;
+        let Some(repl) = non_empty(&self.replace_text_input()) else { return };
+        let Some(tab) = self.active_mut() else { return };
+        let Some(h) = tab.search.hits.get(tab.search.selected).cloned() else { return };
+        let _ = tab.eb.replace(h.offset, u64::from(h.len), repl.as_bytes());
+        tab.cursor = h.offset + repl.len() as u64;
+        tab.anchor = None;
+        tab.invalidate_search();
+        self.status = tr(lang, "status.replaced1").into();
+        self.start_search(); // 重新搜索刷新命中
     }
 
-    fn delete_at_cursor(&mut self, eb: &mut EditableBuffer, forward: bool) {
-        let range = self.sel_range();
-        let cursor = self.cursor;
-        if let Some((st, en)) = range {
-            let _ = eb.delete(st, en - st);
-            self.cursor = st;
-        } else if forward {
-            if cursor < eb.len() {
-                let end = next_boundary(eb, cursor);
-                let _ = eb.delete(cursor, end - cursor);
-            }
-        } else if cursor > 0 {
-            let start = prev_boundary(eb, cursor);
-            let _ = eb.delete(start, cursor - start);
-            self.cursor = start;
-        } else {
+    fn replace_all_in_active(&mut self) {
+        let lang = self.lang;
+        let Some(repl) = non_empty(&self.replace_text_input()) else { return };
+        let Some(tab) = self.active_mut() else { return };
+        if !tab.eb.has_index() {
+            self.status = "行索引构建中".into();
             return;
         }
-        self.anchor = None;
-        self.invalidate_search();
-        self.scroll_to_cursor(eb);
+        if tab.search.input.is_empty() {
+            self.status = "搜索内容为空".into();
+            return;
+        }
+        if tab.search.whole_word {
+            self.status = tr(lang, "status.wordall").into();
+            return;
+        }
+        let needle = tab.search.input.as_bytes().to_vec();
+        let cnt = tab.eb.replace_all(&needle, repl.as_bytes(), !tab.search.case_sensitive);
+        tab.invalidate_search();
+        self.status = format!("{}: {cnt}", tr(lang, "status.replaced_all"));
     }
 
-    fn move_cursor(&mut self, eb: &EditableBuffer, new: u64, extend: bool) {
-        if extend && self.anchor.is_none() {
-            self.anchor = Some(self.cursor);
-        }
-        self.cursor = new;
-        if !extend {
-            self.anchor = None;
-        }
-        self.scroll_to_cursor(eb);
+    fn replace_text_input(&self) -> String {
+        self.tabs
+            .get(self.active)
+            .map(|t| t.replace_input.clone())
+            .unwrap_or_default()
     }
 
-    /// 垂直移动（按字节列保持，ASCII 场景精确）。
-    fn move_line(&mut self, eb: &EditableBuffer, delta: i64, extend: bool) {
-        let cur_line = eb.line_of_offset(self.cursor);
-        let col = self.cursor - eb.start_of_line(cur_line);
-        let n = eb.line_count();
-        let new_line = (cur_line as i64 + delta).clamp(0, n as i64 - 1) as u64;
-        let ls = eb.start_of_line(new_line);
-        let le = eb.line_bounds(new_line).1;
-        self.move_cursor(eb, (ls + col).min(le), extend);
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let dirty = self.tabs[idx].eb.is_dirty();
+        if dirty {
+            self.confirm_close = Some(idx);
+            return;
+        }
+        self.remove_tab(idx);
     }
 
-    fn do_undo(&mut self, eb: &mut EditableBuffer) {
-        if eb.undo() {
-            self.cursor = self.cursor.min(eb.len());
-            self.anchor = None;
-            self.invalidate_search();
-            self.status = "已撤销".into();
-        } else {
-            self.status = "撤销栈已空".into();
+    fn remove_tab(&mut self, idx: usize) {
+        let id = self.tabs[idx].id;
+        if let Some(c) = self.load_cancels.get(&id) {
+            c.store(true, Ordering::Relaxed);
         }
-        self.scroll_to_cursor(eb);
+        self.load_cancels.remove(&id);
+        self.tabs.remove(idx);
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
+        if self.tabs.is_empty() {
+            let t = Tab::new_empty(self.next_tab_id);
+            self.next_tab_id += 1;
+            self.tabs.push(t);
+            self.active = 0;
+        }
     }
+}
 
-    fn do_redo(&mut self, eb: &mut EditableBuffer) {
-        if eb.redo() {
-            self.cursor = self.cursor.min(eb.len());
-            self.anchor = None;
-            self.invalidate_search();
-            self.status = "已重做".into();
-        } else {
-            self.status = "重做栈已空".into();
-        }
-        self.scroll_to_cursor(eb);
-    }
-
-    fn copy_selection_to_clipboard(&mut self, eb: &EditableBuffer) {
-        if let Some((st, en)) = self.sel_range() {
-            if let Some(text) = copy_selection_text(eb, st, en) {
-                if clipboard_set(&text) {
-                    self.status = format!("已复制 {} 字符", text.chars().count());
-                } else {
-                    self.status = "复制失败：剪贴板不可用".into();
-                }
-            }
-        }
-    }
-
-    fn cut_selection(&mut self, eb: &mut EditableBuffer) {
-        if let Some((st, en)) = self.sel_range() {
-            if let Some(text) = copy_selection_text(eb, st, en) {
-                clipboard_set(&text);
-                let _ = eb.delete(st, en - st);
-                self.cursor = st;
-                self.anchor = None;
-                self.invalidate_search();
-                self.status = format!("已剪切 {} 字符", text.chars().count());
-            }
-        }
-    }
-
-    fn paste_from_clipboard(&mut self, eb: &mut EditableBuffer) {
-        match clipboard_get() {
-            Some(text) => self.insert_text(eb, &text),
-            None => self.status = "剪贴板为空或不可用".into(),
-        }
-    }
-
-    fn delete_selection(&mut self, eb: &mut EditableBuffer) {
-        if let Some((st, en)) = self.sel_range() {
-            let _ = eb.delete(st, en - st);
-            self.cursor = st;
-            self.anchor = None;
-            self.invalidate_search();
-        }
-    }
-
-    fn transform_selection(&mut self, eb: &mut EditableBuffer, mode: CaseMode) {
-        if let Some((st, en)) = self.sel_range() {
-            if let Some(text) = copy_selection_text(eb, st, en) {
-                let transformed = match mode {
-                    CaseMode::Upper => text.to_uppercase(),
-                    CaseMode::Lower => text.to_lowercase(),
-                    CaseMode::Title => title_case(&text),
-                };
-                let _ = eb.replace(st, en - st, transformed.as_bytes());
-                self.cursor = st + transformed.len() as u64;
-                self.anchor = None;
-                self.invalidate_search();
-            }
-        }
-    }
-
-    fn do_save(eb: &mut EditableBuffer) -> String {
-        match eb.save() {
-            Ok(()) => format!("已保存 {}（{}）", eb.path().display(), fmt_size(eb.len())),
-            Err(e) => format!("保存失败: {e}"),
-        }
-    }
+fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// pos 前一个字符边界（UTF-8 安全）。
@@ -561,7 +969,7 @@ fn safe_slice(s: &str, r: std::ops::Range<usize>) -> String {
     s[lo..hi].to_string()
 }
 
-/// 双击选词：返回包含 pos 的连续非空白字符段（UTF-8 安全，遇空白结束）。
+/// 双击选词：包含 pos 的连续非空白字符段（遇空白结束，UTF-8 安全）。
 fn word_range_at(eb: &EditableBuffer, pos: u64) -> (u64, u64) {
     let line = eb.line_of_offset(pos);
     let (s, e) = eb.line_bounds(line);
@@ -590,7 +998,6 @@ fn word_range_at(eb: &EditableBuffer, pos: u64) -> (u64, u64) {
     while b2 < bytes.len() && !is_ws(bytes[b2]) {
         b2 += 1;
     }
-    // 对齐 char 边界（多字节字符均非空白，只会退到 lead byte）
     while a > 0 && !text.is_char_boundary(a) {
         a -= 1;
     }
@@ -600,56 +1007,7 @@ fn word_range_at(eb: &EditableBuffer, pos: u64) -> (u64, u64) {
     (s + a as u64, s + b2 as u64)
 }
 
-#[derive(Clone, Copy)]
-pub enum CaseMode {
-    Upper,
-    Lower,
-    Title,
-}
-
-/// 首字母大写其余小写（按空白分词）
-fn title_case(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut at_word_start = true;
-    for c in s.chars() {
-        if c.is_whitespace() {
-            out.push(c);
-            at_word_start = true;
-        } else if at_word_start {
-            out.extend(c.to_uppercase());
-            at_word_start = false;
-        } else {
-            out.extend(c.to_lowercase());
-        }
-    }
-    out
-}
-
-fn clipboard_get() -> Option<String> {
-    arboard::Clipboard::new()
-        .ok()?
-        .get_text()
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-fn clipboard_set(text: &str) -> bool {
-    arboard::Clipboard::new()
-        .ok()
-        .and_then(|mut c| c.set_text(text.to_owned()).ok())
-        .is_some()
-}
-
-fn copy_selection_text(eb: &EditableBuffer, st: u64, en: u64) -> Option<String> {
-    let len = (en - st) as usize;
-    let mut buf = vec![0u8; len];
-    if eb.read(st, &mut buf).is_err() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// 行界来源：索引就绪走索引；否则走已扫描前缀（load_starts）。
+/// 行界来源：索引就绪走索引；否则走已扫描前缀。
 fn line_bounds_at(
     index_ready: bool,
     eb: &EditableBuffer,
@@ -672,8 +1030,7 @@ fn line_bounds_at(
     }
 }
 
-/// 读取一行的显示文本（裁掉行尾 \r\n，截断到 MAX_LINE_BYTES），
-/// 返回 (行起点, 原始行尾, 显示文本)；原始行尾用于截断标记判断。
+/// 读取一行的显示文本，返回 (行起点, 原始行尾, 显示文本)。
 fn read_line_text(
     eb: &EditableBuffer,
     index_ready: bool,
@@ -703,10 +1060,10 @@ fn read_line_text(
     (s, e, String::from_utf8_lossy(v).into_owned())
 }
 
-/// 换行模式下某逻辑行的视觉行数（带缓存；缓存未命中时现场排版）。
+/// 换行模式下某逻辑行的视觉行数（带缓存）。
 #[allow(clippy::too_many_arguments)]
 fn rows_of_line(
-    cache: &mut std::collections::HashMap<u64, u32>,
+    cache: &mut HashMap<u64, u32>,
     ui: &egui::Ui,
     font: &egui::FontId,
     text_w: f32,
@@ -720,8 +1077,10 @@ fn rows_of_line(
     if let Some(&r) = cache.get(&line) {
         return r;
     }
-    let (_, _e, text) = read_line_text(eb, index_ready, load_starts, covered_lines, covered_bytes, line);
-    let galley = ui.fonts(|f| f.layout(text, font.clone(), FG, text_w));    let r = galley.rows.len().max(1) as u32;
+    let (_, _, text) =
+        read_line_text(eb, index_ready, load_starts, covered_lines, covered_bytes, line);
+    let galley = ui.fonts(|f| f.layout(text, font.clone(), theme_ui::TEXT_MEASURE, text_w));
+    let r = galley.rows.len().max(1) as u32;
     if cache.len() > 100_000 {
         cache.clear();
     }
@@ -729,10 +1088,10 @@ fn rows_of_line(
     r
 }
 
-/// 换行模式滚轮：按视觉行逐行滚动（forward = 向内容尾部）。
+/// 换行模式滚轮：按视觉行滚动。
 #[allow(clippy::too_many_arguments)]
 fn step_visual(
-    cache: &mut std::collections::HashMap<u64, u32>,
+    cache: &mut HashMap<u64, u32>,
     ui: &egui::Ui,
     font: &egui::FontId,
     text_w: f32,
@@ -746,7 +1105,9 @@ fn step_visual(
     skip: &mut u64,
     forward: bool,
 ) {
-    let cur = rows_of_line(cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes, *first) as u64;
+    let cur = rows_of_line(
+        cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes, *first,
+    ) as u64;
     if forward {
         if *skip + 1 < cur {
             *skip += 1;
@@ -758,12 +1119,15 @@ fn step_visual(
         *skip -= 1;
     } else if *first > 0 {
         *first -= 1;
-        let prev = rows_of_line(cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes, *first) as u64;
+        let prev = rows_of_line(
+            cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes,
+            *first,
+        ) as u64;
         *skip = prev - 1;
     }
 }
 
-/// 非换行模式的点击命中：视觉行 → 行 → 字符列 → 字节偏移。
+/// 非换行模式点击命中（与渲染共用排版引擎）。
 #[allow(clippy::too_many_arguments)]
 fn cursor_at_pointer_flat(
     first_line: u64,
@@ -781,8 +1145,6 @@ fn cursor_at_pointer_flat(
     line_height: f32,
     h_scroll: f32,
 ) -> u64 {
-    // 与渲染共用同一排版引擎做命中测试：消除"字符数×单字符宽度"估算
-    // 在中英文混排/字间距下的累积误差
     let row = (((pos.y - rect.top()) / line_height).floor().max(0.0)) as u64;
     let line = (first_line + row).min(n.saturating_sub(1));
     let (s, e) = line_bounds_at(index_ready, eb, load_starts, covered_lines, covered_bytes, line);
@@ -803,7 +1165,7 @@ fn cursor_at_pointer_flat(
     if text.is_empty() {
         return s;
     }
-    let galley = ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), FG));
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), theme_ui::TEXT_MEASURE));
     let sp = egui::vec2(pos.x - text_left + h_scroll, line_height * 0.5);
     let cur = galley.cursor_from_pos(sp);
     let char_idx = cur.index.min(text.chars().count());
@@ -811,10 +1173,10 @@ fn cursor_at_pointer_flat(
     s + byte as u64
 }
 
-/// 换行模式的点击命中：视觉行 → (逻辑行, 行内视觉行)，再经整行 galley 命中测试取字符。
+/// 换行模式点击命中。
 #[allow(clippy::too_many_arguments)]
 fn cursor_at_pointer_wrap(
-    cache: &mut std::collections::HashMap<u64, u32>,
+    cache: &mut HashMap<u64, u32>,
     ui: &egui::Ui,
     font: &egui::FontId,
     text_w: f32,
@@ -834,21 +1196,26 @@ fn cursor_at_pointer_wrap(
     let vrow = (((pos.y - rect.top()) / line_height).floor().max(0.0)) as u64;
     let mut line = first;
     let mut rem = skip + vrow;
-    let mut rows = rows_of_line(cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes, line) as u64;
+    let mut rows = rows_of_line(
+        cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes, line,
+    ) as u64;
     while rem >= rows && line + 1 < n {
         rem -= rows;
         line += 1;
-        rows = rows_of_line(cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes, line) as u64;
+        rows = rows_of_line(
+            cache, ui, font, text_w, eb, index_ready, load_starts, covered_lines, covered_bytes,
+            line,
+        ) as u64;
     }
     if rem >= rows {
         rem = rows - 1;
     }
-    let (s, _e, text) = read_line_text(eb, index_ready, load_starts, covered_lines, covered_bytes, line);
+    let (s, _e, text) =
+        read_line_text(eb, index_ready, load_starts, covered_lines, covered_bytes, line);
     if text.is_empty() {
         return s;
     }
-    let galley = ui.fonts(|f| f.layout(text.clone(), font.clone(), FG, text_w));
-    // 行内视觉行中心做命中测试
+    let galley = ui.fonts(|f| f.layout(text.clone(), font.clone(), theme_ui::TEXT_MEASURE, text_w));
     let sp = egui::vec2(pos.x - text_left, rem as f32 * line_height + line_height * 0.5);
     let cur = galley.cursor_from_pos(sp);
     let char_idx = cur.index.min(text.chars().count());
@@ -856,45 +1223,170 @@ fn cursor_at_pointer_wrap(
     s + byte as u64
 }
 
+// 最近文件持久化
+fn recent_conf_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("recent_files.txt")))
+}
+
+fn load_recent_files() -> Vec<PathBuf> {
+    let Some(p) = recent_conf_path() else { return Vec::new() };
+    std::fs::read_to_string(p)
+        .map(|text| {
+            text.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_recent_files(files: &[PathBuf]) {
+    if let Some(p) = recent_conf_path() {
+        let text: String = files
+            .iter()
+            .map(|f| f.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(p, text);
+    }
+}
+
+fn install_cjk_font(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\Deng.ttf",
+        "C:\\Windows\\Fonts\\simfang.ttf",
+    ];
+    for p in CANDIDATES {
+        if let Ok(data) = std::fs::read(p) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("cjk".to_owned(), Arc::new(egui::FontData::from_owned(data)));
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.entry(family).or_default().push("cjk".to_owned());
+            }
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
+/// 应用编辑字体选择：重建字体定义（保留 CJK 回退）。
+fn apply_editor_font(ctx: &egui::Context, file: &str) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Ok(data) = std::fs::read("C:\\Windows\\Fonts\\simhei.ttf") {
+        fonts
+            .font_data
+            .insert("cjk".to_owned(), Arc::new(egui::FontData::from_owned(data)));
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push("cjk".to_owned());
+        }
+    }
+    if !file.is_empty() {
+        if let Ok(data) = std::fs::read(file) {
+            fonts.font_data.insert(
+                "editor-font".to_owned(),
+                Arc::new(egui::FontData::from_owned(data)),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "editor-font".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn main() -> eframe::Result<()> {
+    // 窗口图标（任务栏/标题栏）
+    let icon_rgba = image::load_from_memory(LOGO_PNG)
+        .expect("内置 logo 解码失败")
+        .to_rgba8();
+    let icon = egui::IconData {
+        width: icon_rgba.width(),
+        height: icon_rgba.height(),
+        rgba: icon_rgba.into_raw(),
+    };
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1180.0, 760.0])
+            .with_title("HiEditor Pro")
+            .with_icon(Arc::new(icon)),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "HiEditor Pro",
+        options,
+        Box::new(move |cc| {
+            install_cjk_font(&cc.egui_ctx);
+            cc.egui_ctx.set_visuals(egui::Visuals::light());
+            Ok(Box::new(App::new(cc)))
+        }),
+    )
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 轮询后台打开（Head 先到 → 立即可浏览；
-        // Coverage 随顺序扫描增量到达（覆盖范围持续增长）；Index 后到 → 解锁编辑/搜索）
+        let lang = self.lang;
+        let th = editor_theme(self.theme_mode == ThemeMode::Dark);
+        self.pointer_x = ctx
+            .input(|i| i.pointer.latest_pos().map(|p| p.x).unwrap_or(f32::NAN));
+        self.pointer_x = ctx
+            .input(|i| i.pointer.latest_pos().map(|p| p.x).unwrap_or(f32::NAN));
+        self.pointer_x = ctx
+            .input(|i| i.pointer.latest_pos().map(|p| p.x).unwrap_or(f32::NAN));
+        // ---- 轮询后台打开（按 tab_id 路由）----
         if let Some(rx) = &self.open_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(OpenMsg::Head { eb, total }) => {
-                        let desc = format!(
-                            "{} · {} · {}",
-                            eb.backend(),
-                            eb.encoding().name(),
-                            fmt_size(eb.len())
-                        );
+                    Ok(OpenMsg::Head { tab_id, eb, total }) => {
+                        if !self.load_cancels.contains_key(&tab_id) {
+                            continue; // 标签页已被关闭
+                        }
+                        let title = eb
+                            .path()
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "无标题".into());
+                        let backend = eb.backend().to_string();
+                        let size = fmt_size(eb.len());
+                        let mut t = Tab::new(tab_id, eb);
+                        t.load_total = total;
+                        self.tabs.push(t);
+                        self.active = self.tabs.len() - 1;
                         self.status =
-                            format!("已打开 {}（{}）· 建索引中", eb.path().display(), desc);
-                        self.eb = Some(eb);
-                        self.load_total = total;
-                        self.cursor = 0;
-                        self.anchor = None;
-                        self.first_line = 0;
+                            format!("{} {title}（{backend} · {size}）· {}", tr(lang, "status.opened"), tr(lang, "status.indexing"));
                     }
-                    Ok(OpenMsg::Coverage { starts, covered_lines, covered_bytes }) => {
-                        self.load_starts.extend(starts.iter().copied());
-                        self.covered_lines = covered_lines;
-                        self.covered_bytes = covered_bytes;
+                    Ok(OpenMsg::Coverage { tab_id, starts, covered_lines, covered_bytes }) => {
+                        if let Some(t) = self
+                            .tabs
+                            .iter_mut()
+                            .find(|t| t.id == tab_id)
+                        {
+                            t.load_starts.extend(starts.iter().copied());
+                            t.covered_lines = covered_lines;
+                            t.covered_bytes = covered_bytes;
+                        }
                     }
-                    Ok(OpenMsg::Index(idx)) => {
-                        let lines = if let Some(eb) = self.eb.as_mut() {
-                            eb.set_index(*idx);
-                            eb.line_count()
-                        } else {
-                            0
-                        };
-                        self.load_starts = Vec::new();
-                        self.status = format!("索引就绪：{} 行，可编辑/搜索", lines);
+                    Ok(OpenMsg::Index { tab_id, idx }) => {
+                        self.load_cancels.remove(&tab_id);
+                        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            t.eb.set_index(*idx);
+                            let lines = t.eb.line_count();
+                            if self.tabs[self.active].id == tab_id {
+                                self.status =
+                                    format!("{}: {lines} {}", tr(lang, "status.ready"), tr(lang, "status.editable"));
+                            }
+                        }
                     }
-                    Ok(OpenMsg::Error(e)) => {
-                        self.open_error = Some(e);
+                    Ok(OpenMsg::Error { tab_id, msg }) => {
+                        let _ = tab_id;
+                        let _ = tab_id;
+                    self.open_error = Some(format!("{}: {msg}", tr(lang, "status.openfailed")));
                         self.open_rx = None;
                         break;
                     }
@@ -906,62 +1398,87 @@ impl eframe::App for App {
                 }
             }
         }
-        // 加载中：跟随进度刷新
+
+        // ---- 轮询所有标签页的后台搜索 ----
+        for ti in 0..self.tabs.len() {
+            let done = self.tabs[ti]
+                .search
+                .job
+                .as_ref()
+                .map(|j| j.is_done())
+                .unwrap_or(false);
+            if !done {
+                continue;
+            }
+            let Some(job) = self.tabs[ti].search.job.take() else { continue };
+            let tab = &mut self.tabs[ti];
+            if let Some(err) = job.error() {
+                if ti == self.active {
+                    self.status = format!("搜索失败: {err}");
+                }
+                continue;
+            }
+            let mut hits = job.hits_snapshot();
+            hits.sort_by_key(|h| h.offset);
+            // 全词匹配过滤
+            if tab.search.whole_word {
+                let vlen = tab.eb.len();
+                hits.retain(|h| {
+                    let mut ok = true;
+                    let mut b = [0u8; 1];
+                    if h.offset > 0 && tab.eb.read(h.offset - 1, &mut b).is_ok() {
+                        ok &= is_word_byte(b[0]);
+                    }
+                    if (h.offset + h.len as u64) < vlen
+                        && tab.eb.read(h.offset + h.len as u64, &mut b).is_ok()
+                    {
+                        ok &= !is_word_byte(b[0]);
+                    }
+                    ok
+                });
+            }
+            let n = hits.len();
+            tab.search.hits = Arc::new(hits);
+            tab.search.selected = 0;
+            if ti == self.active {
+                self.status = format!("{} {n}", tr(lang, "status.searchdone"));
+            }
+        }
+        if let Some(t) = self.tabs.get(self.active) {
+            if t.search.job.is_some() {
+                let (p, total) = t.search.job.as_ref().unwrap().progress();
+                let hits = t.search.job.as_ref().map(|j| j.hit_count()).unwrap_or(0);
+                self.status = format!("{} {p}/{total} · {hits}", tr(lang, "status.searching"));
+                ctx.request_repaint_after(Duration::from_millis(60));
+            }
+        }
         if self.is_loading() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
-        // 轮询后台搜索（任务完成后收割结果，按偏移排序供高亮与跳转）
-        if let Some(job) = &self.search.job {
-            if job.is_done() {
-                if let Some(err) = job.error() {
-                    self.status = format!("搜索失败: {err}");
-                } else {
-                    let mut hits = job.hits_snapshot();
-                    hits.sort_by_key(|h| h.offset);
-                    let n_hits = hits.len();
-                    let elapsed = job.elapsed();
-                    self.search.hits = Arc::new(hits);
-                    self.search.selected = 0;
-                    self.status = format!(
-                        "搜索完成: 命中 {} 条，耗时 {:.0} ms（点 ▲▼ 在命中间跳转）",
-                        n_hits,
-                        elapsed.as_secs_f64() * 1e3
-                    );
-                }
-                self.search.job = None;
-            } else {
-                let (p, total) = job.progress();
-                self.status = format!("搜索中… {p}/{total} 块，已命中 {}", job.hit_count());
-                ctx.request_repaint_after(Duration::from_millis(60));
-            }
-        }
-
-        // 拖放文件到窗口 → 直接打开（悬停时显示提示遮罩）
+        // ---- 拖放文件 → 新标签页打开 ----
         let hovered = ctx.input(|i| i.raw.hovered_files.clone());
         if !hovered.is_empty() {
             let screen = ctx.screen_rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("drop_overlay"),
-            ));
+            let painter =
+                ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));
             painter.rect_filled(
                 screen,
                 0.0,
-                egui::Color32::from_rgba_unmultiplied(80, 140, 220, 36),
+                theme_ui::drop_overlay_bg(),
             );
             painter.rect_stroke(
                 screen.shrink(6.0),
                 6.0,
-                egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(90, 150, 230)),
+                egui::Stroke::new(3.0_f32, theme_ui::DROP_OVERLAY_STROKE),
                 egui::StrokeKind::Inside,
             );
             painter.text(
                 screen.center(),
                 egui::Align2::CENTER_CENTER,
-                "松开以打开文件",
+                tr(lang, "drop.hint"),
                 egui::FontId::proportional(30.0),
-                egui::Color32::from_rgb(235, 242, 255),
+                theme_ui::DROP_OVERLAY_TEXT,
             );
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -972,234 +1489,976 @@ impl eframe::App for App {
             }
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
+        // ---- 顶部：菜单栏 ----
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("文件:");
-                let path_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.path_input)
-                        .desired_width(ui.available_width() - 250.0)
-                        .hint_text("输入文件路径…"),
-                );
-                if path_resp.has_focus() {
-                    self.editor_focused = false;
-                }
-                let open_clicked =
-                    path_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("打开").clicked() || open_clicked {
-                    if !self.path_input.trim().is_empty() {
-                        let p = PathBuf::from(self.path_input.trim());
-                        self.request_open(p);
+                egui::containers::menu::MenuBar::new().ui(ui, |ui| {
+                    ui.menu_button(tr(lang, "menu.file"), |ui| {
+                        ui.set_min_width(220.0);
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.new_tab"))
+                                    .shortcut_text("Ctrl+N"),
+                            )
+                            .clicked()
+                        {
+                            self.new_tab();
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                false,
+                                egui::Button::new(tr(lang, "file.new_window"))
+                                    .shortcut_text("Ctrl+Shift+N"),
+                            )
+                            .clicked()
+                        {}
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.open"))
+                                    .shortcut_text("Ctrl+O"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("文本文件", &["txt", "log", "csv", "json", "md", "rs", "py", "js", "html", "css", "xml", "yaml", "yml", "toml", "cfg", "ini"])
+                                .add_filter("所有文件", &["*"])
+                                .pick_file()
+                            {
+                                self.path_input = path.display().to_string();
+                                self.request_open(path);
+                            }
+                            ui.close();
+                        }
+                        ui.menu_button(tr(lang, "file.open_recent"), |ui| {
+                            ui.set_min_width(280.0);
+                            if self.recent_files.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(tr(lang, "status.no_recent")).weak(),
+                                );
+                            } else {
+                                for path in self.recent_files.clone() {
+                                    let name = path
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| path.display().to_string());
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new(&name).size(12.0),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.path_input = path.display().to_string();
+                                        self.request_open(path.clone());
+                                        ui.close();
+                                    }
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.save"))
+                                    .shortcut_text("Ctrl+S"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(t) = self.active_mut() {
+                                self.status = t.do_save(lang);
+                            }
+                            ui.close();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.saveas"))
+                                    .shortcut_text("Ctrl+Shift+S"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(t) = self.active_mut() {
+                                let suggested = t
+                                    .eb
+                                    .path()
+                                    .file_name()
+                                    .map(|s| format!("{}.sav", s.to_string_lossy()))
+                                    .unwrap_or_else(|| "untitled.txt".into());
+                                if let Some(target) = rfd::FileDialog::new()
+                                    .set_file_name(&suggested)
+                                    .save_file()
+                                {
+                                    match t.eb.save_as(&target) {
+                                        Ok(()) => {
+                                            self.status = format!(
+                                                "{} {}",
+                                                tr(lang, "status.saved"),
+                                                target.display()
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.status = format!(
+                                                "{}: {e}",
+                                                tr(lang, "status.savefail")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            ui.close();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.save_all"))
+                                    .shortcut_text("Ctrl+Alt+S"),
+                            )
+                            .clicked()
+                        {
+                            let n = self.save_all_dirty();
+                            self.status = format!(
+                                "{}: {}",
+                                tr(lang, "status.saveall_done"),
+                                n
+                            );
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                false,
+                                egui::Button::new(tr(lang, "file.print"))
+                                    .shortcut_text("Ctrl+P"),
+                            )
+                            .clicked()
+                        {}
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.close_tab"))
+                                    .shortcut_text("Ctrl+W"),
+                            )
+                            .clicked()
+                        {
+                            self.close_active_tab();
+                            ui.close();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.close_window"))
+                                    .shortcut_text("Ctrl+Shift+W"),
+                            )
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        ui.separator();
+                        if ui.button(tr(lang, "file.settings")).clicked() {
+                            self.show_settings = true;
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(tr(lang, "file.exit"))
+                                    .shortcut_text("Alt+F4"),
+                            )
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+                        ui.menu_button(tr(lang, "menu.edit"), |ui| {
+                        ui.set_min_width(130.0);
+                        let (can_undo, can_redo, has_sel, len) = self
+                            .active_mut()
+                            .map(|t| {
+                                (
+                                    t.eb.undo_depth() > 0,
+                                    t.eb.redo_depth() > 0,
+                                    t.sel_range().is_some(),
+                                    t.eb.len(),
+                                )
+                            })
+                            .unwrap_or((false, false, false, 0));
+                        if ui.add_enabled(can_undo, egui::Button::new(tr(lang, "edit.undo"))).clicked() {
+                            if let Some(t) = self.active_mut() {
+                                t.do_undo();
+                            }
+                            ui.close();
+                        }
+                        if ui.add_enabled(can_redo, egui::Button::new(tr(lang, "edit.redo"))).clicked() {
+                            if let Some(t) = self.active_mut() {
+                                t.do_redo();
+                            }
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.add_enabled(len > 0, egui::Button::new(tr(lang, "edit.selectall"))).clicked() {
+                            if let Some(t) = self.active_mut() {
+                                t.anchor = Some(0);
+                                t.cursor = t.eb.len();
+                            }
+                            ui.close();
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.cut"))).clicked() {
+                            if let Some(t) = self.active_mut() {
+                                t.cut_selection();
+                            }
+                            ui.close();
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.copy"))).clicked() {
+                            if let Some(t) = self.active_mut() {
+                                t.copy_selection();
+                            }
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(clipboard_get().is_some(), egui::Button::new(tr(lang, "edit.paste")))
+                            .clicked()
+                        {
+                            if let Some(t) = self.active_mut() {
+                                t.paste_from_clipboard();
+                            }
+                            ui.close();
+                        }
+                        if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.delete"))).clicked() {
+                            if let Some(t) = self.active_mut() {
+                                t.delete_selection();
+                            }
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button(tr(lang, "menu.search"), |ui| {
+                        ui.set_min_width(130.0);
+                        if ui.button(tr(lang, "search.menufind")).clicked() {
+                            self.show_find = true;
+                            self.show_replace = false;
+                            ui.close();
+                        }
+                        if ui.button(tr(lang, "search.menufr")).clicked() {
+                            self.show_find = true;
+                            self.show_replace = true;
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button(tr(lang, "menu.view"), |ui| {
+                        ui.set_min_width(130.0);
+                        let mut w = self.wrap;
+                        if ui.checkbox(&mut w, tr(lang, "view.wrap")).changed() {
+                            self.wrap = w;
+                            if let Some(t) = self.active_mut() {
+                                t.wrap_skip = 0;
+                                t.wrap_rows.clear();
+                                t.h_scroll = 0.0;
+                            }
+                        }
+                    });
+                    if ui.button(tr(lang, "menu.about")).clicked() {
+                        self.show_about = true;
                     }
-                }
-                if ui.button("重新打开").clicked() {
-                    if let Some(p) = self.eb.as_ref().map(|e| e.path().to_path_buf()) {
-                        self.request_open(p);
-                    }
-                }
-                if ui.button("保存 Ctrl+S").clicked() {
-                    if let Some(eb) = self.eb.as_mut() {
-                        self.status = Self::do_save(eb);
-                    }
-                }
-                if self.eb.as_ref().map(|e| e.is_dirty()).unwrap_or(false) {
-                    ui.colored_label(egui::Color32::from_rgb(240, 170, 80), "● 未保存");
-                }
-            });
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label("搜索:");
-                let search_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.search.input)
-                        .desired_width(ui.available_width() - 330.0)
-                        .hint_text("输入关键词回车搜索…"),
-                );
-                if search_resp.has_focus() {
-                    self.editor_focused = false;
-                }
-                let submit =
-                    search_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if ui.button("搜索").clicked() || submit {
-                    self.start_search();
-                }
-                ui.checkbox(&mut self.search.case_sensitive, "区分大小写");
-                if ui.checkbox(&mut self.wrap, "自动换行").changed() {
-                    self.wrap_skip = 0;
-                    self.wrap_rows.clear();
-                    self.h_scroll = 0.0;
-                }
-                let total = self.search.hits.len();
-                if !self.search.hits.is_empty() {
-                    if ui.button("▲").clicked() {
-                        self.search.selected = self.search.selected.saturating_sub(1);
-                        self.goto_hit(self.last_visible);
-                    }
-                    ui.label(format!("{}/{}", self.search.selected + 1, total));
-                    if ui.button("▼").clicked() {
-                        self.search.selected = (self.search.selected + 1).min(total - 1);
-                        self.goto_hit(self.last_visible);
-                    }
-                }
-            });
-            ui.add_space(4.0);
-        });
-
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(eb) = &self.eb {
-                    if eb.has_index() {
-                        let cur_line = eb.line_of_offset(self.cursor);
-                        let col = self.cursor - eb.start_of_line(cur_line);
-                        ui.label(format!(
-                            "行 {} 列 {} · {} 行 · {} · {}{}",
-                            cur_line + 1,
-                            col + 1,
-                            eb.line_count(),
-                            eb.encoding().name(),
-                            eb.backend(),
-                            if eb.is_dirty() { " · ●未保存" } else { "" }
-                        ));
-                    } else {
-                        let pct = if self.load_total > 0 {
-                            (self.covered_bytes * 100 / self.load_total).min(100)
-                        } else {
-                            0
-                        };
-                        ui.label(format!(
-                            "已索引 {} / {}（{}%）· {} 行可浏览 · 完成后可编辑 · {}",
-                            fmt_size(self.covered_bytes),
-                            fmt_size(self.load_total),
-                            pct,
-                            self.covered_lines,
-                            eb.encoding().name()
-                        ));
-                    }
-                }
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.status);
+                    let _ = ui.button("⚙"); // 预留：设置入口
+                    if ui.button("🔔").clicked() {
+                        self.status = "HiEditor Pro v0.3".into();
+                    }
                 });
             });
         });
 
+        // ---- 字体工具栏 ----
+        egui::TopBottomPanel::top("font_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(tr(lang, "toolbar.font"));
+                let cur = self.font_name.clone();
+                egui::ComboBox::from_id_salt("font_choice")
+                    .selected_text(if cur == "默认字体" { tr(lang, "font.default").to_string() } else { cur.clone() })
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for (name, file) in FONT_CHOICES {
+                            if ui.selectable_label(cur == *name, if *name == "默认字体" { tr(lang, "font.default").to_string() } else { (*name).to_string() }).clicked() {
+                                self.font_name = (*name).to_string();
+                                apply_editor_font(ctx, file);
+                            }
+                        }
+                    });
+                ui.label(tr(lang, "toolbar.size"));
+                egui::ComboBox::from_id_salt("size_choice")
+                    .selected_text(format!("{} px", self.font_size as u32))
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        for s in [10, 12, 14, 15, 16, 18, 20, 24, 28] {
+                            if ui
+                                .selectable_label(self.font_size == s as f32, format!("{s} px"))
+                                .clicked()
+                            {
+                                self.font_size = s as f32;
+                                if let Some(t) = self.active_mut() {
+                                    t.wrap_rows.clear();
+                                    t.wrap_skip = 0;
+                                }
+                            }
+                        }
+                    });
+                let _ = ui.button("…"); // 预留：更多工具栏入口
+            });
+            ui.add_space(2.0);
+        });
+
+        // ---- 标签页栏 ----
+        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                let mut close_request: Option<usize> = None;
+                let mut new_rects: Vec<(u64, egui::Rect)> = Vec::new();
+
+                // ---- 拖拽排序：命中测试用上一帧的 Tab 矩形 ----
+                let dragging_id = egui::DragAndDrop::payload::<u64>(ui.ctx()).map(|a| *a);
+                if let Some(drag_id) = dragging_id {
+                    if let Some(from) = self.tabs.iter().position(|t| t.id == drag_id) {
+                        for (rid, r) in &self.tab_rects {
+                            if *rid == drag_id {
+                                continue;
+                            }
+                            let hit = self.pointer_x >= r.left() && self.pointer_x <= r.right();
+                            if !hit {
+                                continue;
+                            }
+                            let hovered_idx = self
+                                .tabs
+                                .iter()
+                                .position(|t| t.id == *rid)
+                                .unwrap();
+                            if hovered_idx == from {
+                                continue;
+                            }
+                            let moved = self.tabs.remove(from);
+                            let insert_at = hovered_idx;
+                            self.tabs.insert(insert_at, moved);
+                            self.active = hovered_idx;
+                            break;
+                        }
+                    }
+                }
+
+                for i in 0..self.tabs.len() {
+                    let (title, dirty, is_loading) = {
+                        let t = &self.tabs[i];
+                        let mut ti = t.title();
+                        if ti == "无标题" {
+                            ti = tr(lang, "tab.untitled").to_string();
+                        }
+                        (ti, t.eb.is_dirty(), t.is_loading())
+                    };
+                    let label = if dirty {
+                        format!("{title} •")
+                    } else {
+                        title.clone()
+                    };
+                    let is_dragging_this = dragging_id == Some(self.tabs[i].id);
+                    let tab_resp = ui
+                        .selectable_label(
+                            i == self.active && !is_dragging_this,
+                            egui::RichText::new(&label),
+                        )
+                        .interact(egui::Sense::click_and_drag());
+                    if tab_resp.drag_started() {
+                        egui::DragAndDrop::set_payload(ui.ctx(), self.tabs[i].id);
+                        self.active = i;
+                    }
+                    if tab_resp.clicked() {
+                        self.active = i;
+                        self.editor_focused = true;
+                    }
+                    new_rects.push((self.tabs[i].id, tab_resp.rect));
+
+                    let close_resp = ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("×").size(12.0))
+                                .frame(false),
+                        )
+                        .on_hover_text(tr(lang, "tab.close"));
+                    if close_resp.clicked() {
+                        close_request = Some(i);
+                    }
+                    if is_loading && i == self.active {
+                        ui.label(
+                            egui::RichText::new("⏳")
+                                .color(theme_ui::TAB_LOADING_ICON),
+                        );
+                    }
+                    ui.add_space(4.0);
+
+                    // ---- Tab 右键菜单 ----
+                    tab_resp.context_menu(|ui| {
+                        ui.set_min_width(190.0);
+                        let dirty = self.tabs[i].eb.is_dirty();
+                        let has_path = !self.tabs[i].eb.path().as_os_str().is_empty();
+                        let others = self.tabs.len() > 1;
+                        let others_dirty = self
+                            .tabs
+                            .iter()
+                            .enumerate()
+                            .any(|(j, tt)| j != i && tt.eb.is_dirty());
+                        if ui.button(tr(lang, "tab.close_menu")).clicked() {
+                            close_request = Some(i);
+                        }
+                        if ui
+                            .add_enabled(
+                                others && !others_dirty,
+                                egui::Button::new(tr(lang, "tab.close_others")),
+                            )
+                            .on_disabled_hover_text(tr(lang, "tab.close_others_hint"))
+                            .clicked()
+                        {
+                            for j in (0..self.tabs.len()).rev() {
+                                if j != i {
+                                    let cid = self.tabs[j].id;
+                                    if let Some(c) = self.load_cancels.get(&cid) {
+                                        c.store(true, Ordering::Relaxed);
+                                    }
+                                    self.load_cancels.remove(&cid);
+                                    self.tabs.remove(j);
+                                    if self.active >= j && self.active > 0 {
+                                        self.active -= 1;
+                                    }
+                                }
+                            }
+                            if self.active >= self.tabs.len() {
+                                self.active = self.tabs.len().saturating_sub(1);
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(dirty, egui::Button::new(tr(lang, "file.save")))
+                            .clicked()
+                        {
+                            self.status = self.tabs[i].do_save(lang);
+                        }
+                        if ui
+                            .add_enabled(false, egui::Button::new(tr(lang, "file.saveas")))
+                            .on_disabled_hover_text(tr(lang, "status.comingsoon"))
+                            .clicked()
+                        {}
+                        ui.separator();
+                        if ui
+                            .add_enabled(has_path, egui::Button::new(tr(lang, "tab.openfolder")))
+                            .clicked()
+                        {
+                            if let Some(d) = self.tabs[i].eb.path().parent() {
+                                let _ = std::process::Command::new("explorer").arg(d).spawn();
+                            }
+                        }
+                        if ui
+                            .add_enabled(has_path, egui::Button::new(tr(lang, "tab.copydir")))
+                            .clicked()
+                        {
+                            let d = self.tabs[i]
+                                .eb
+                                .path()
+                                .parent()
+                                .map(|d| d.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let _ = clipboard_set(&d);
+                        }
+                        if ui
+                            .add_enabled(has_path, egui::Button::new(tr(lang, "tab.copyfile")))
+                            .clicked()
+                        {
+                            let f = self.tabs[i].eb.path().to_string_lossy().to_string();
+                            let _ = clipboard_set(&f);
+                        }
+                    });
+                }
+                self.tab_rects = new_rects;
+
+                // ＋ 新建标签页按钮
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("＋").size(14.0),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_text(tr(lang, "tab.new"))
+                    .clicked()
+                {
+                    self.new_tab();
+                }
+
+                if ui.input(|i| i.pointer.primary_released()) {
+                    egui::DragAndDrop::clear_payload(ui.ctx());
+                }
+                if let Some(i) = close_request {
+                    self.close_tab(i);
+                }
+            });
+            ui.add_space(2.0);
+        });
+
+        // ---- 查找/替换面板 ----
+        if self.show_find {
+            egui::TopBottomPanel::top("find_bar").show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "search.label"));
+                    if let Some(t) = self.active_mut() {
+                        ui.add_sized(
+                            [220.0, 20.0],
+                            egui::TextEdit::singleline(&mut t.search.input)
+                                .hint_text(tr(lang, "search.findhint")),
+                        );
+                    }
+                    if ui.button(tr(lang, "search.next")).clicked() {
+                        self.start_search();
+                        self.goto_hit(1);
+                    }
+                    if ui.button(tr(lang, "search.prev")).clicked() {
+                        self.start_search();
+                        self.goto_hit(-1);
+                    }
+                    if ui.button(tr(lang, "search.all")).clicked() {
+                        self.start_search();
+                    }
+                    let mut cs = self
+                        .active_mut()
+                        .map(|t| t.search.case_sensitive)
+                        .unwrap_or(false);
+                    if ui.checkbox(&mut cs, tr(lang, "search.case")).changed() {
+                        if let Some(t) = self.active_mut() {
+                            t.search.case_sensitive = cs;
+                        }
+                    }
+                    let mut ww = self
+                        .active_mut()
+                        .map(|t| t.search.whole_word)
+                        .unwrap_or(false);
+                    if ui.checkbox(&mut ww, tr(lang, "search.word")).changed() {
+                        if let Some(t) = self.active_mut() {
+                            t.search.whole_word = ww;
+                        }
+                    }
+                    let mut re = false;
+                    if ui
+                        .add_enabled(false, egui::Checkbox::without_text(&mut re))
+                        .on_hover_text(tr(lang, "search.regex_pending"))
+                        .changed()
+                    {
+                        // 占位
+                    }
+                    ui.label(egui::RichText::new(tr(lang, "search.regex")).weak());
+                    if ui.button("×").clicked() {
+                        self.show_find = false;
+                        self.show_replace = false;
+                    }
+                });
+                if self.show_replace {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(lang, "search.replace"));
+                        if let Some(t) = self.active_mut() {
+                            ui.add_sized(
+                                [220.0, 20.0],
+                                egui::TextEdit::singleline(&mut t.replace_input)
+                                    .hint_text(tr(lang, "search.replacehint")),
+                            );
+                        }
+                        if ui.button(tr(lang, "search.replace")).clicked() {
+                            self.replace_current();
+                        }
+                        if ui.button(tr(lang, "search.replaceall")).clicked() {
+                            self.replace_all_in_active();
+                        }
+                    });
+                }
+                ui.add_space(2.0);
+            });
+        }
+
+        // ---- 状态栏 ----
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(t) = &self.tabs.get(self.active) {
+                    if t.eb.has_index() {
+                        let cur_line = t.eb.line_of_offset(t.cursor);
+                        let col = t.cursor - t.eb.start_of_line(cur_line);
+                        ui.label(format!("行 {} 列 {}", cur_line + 1, col + 1));
+                        ui.separator();
+                        ui.label(format!("共 {} 行", t.eb.line_count()));
+                        ui.separator();
+                        ui.label(format!(
+                            "{} · {}",
+                            t.eb.encoding().name(),
+                            t.eb.backend()
+                        ));
+                    } else {
+                        let pct = if t.load_total > 0 {
+                            (t.covered_bytes * 100 / t.load_total).min(100)
+                        } else {
+                            0
+                        };
+                        ui.label(format!(
+                            "已索引 {} / {}（{}%）· {} 行可浏览 · 索引完成后可编辑/搜索",
+                            fmt_size(t.covered_bytes),
+                            fmt_size(t.load_total),
+                            pct,
+                            t.covered_lines
+                        ));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(t) = &self.tabs.get(self.active) {
+                        let le = match t.eb.line_ending_hint() {
+                            hieditor_core::lineindex::LineEnding::Crlf => "Windows (CRLF)",
+                            hieditor_core::lineindex::LineEnding::Lf => "Unix (LF)",
+                            hieditor_core::lineindex::LineEnding::Cr => "CR",
+                            hieditor_core::lineindex::LineEnding::Mixed => if lang.is_zh() { "混合换行" } else { "Mixed line endings" },
+                            hieditor_core::lineindex::LineEnding::None => "—",
+                        };
+                        ui.label(le);
+                        ui.separator();
+                        ui.label(t.eb.encoding().name());
+                        ui.separator();
+                        ui.label("100%");
+                    }
+                    ui.separator();
+                    if self
+                        .active_mut()
+                        .map(|t| t.eb.is_dirty())
+                        .unwrap_or(false)
+                    {
+                        ui.label(egui::RichText::new(tr(lang, "status.unsaved")).color(theme_ui::DIRTY_MARK));
+                    }
+                    if self.status.is_empty() {
+                        ui.label(tr(lang, "status.ready_init"));
+                    } else {
+                        ui.label(&self.status);
+                    }
+                });
+            });
+        });
+
+        // ---- 编辑区 ----
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG))
+            .frame(egui::Frame::default().fill(th.bg))
             .show(ctx, |ui| {
                 if let Some(err) = &self.open_error {
                     ui.colored_label(
-                        egui::Color32::from_rgb(240, 100, 100),
-                        format!("打开失败: {err}"),
+                        theme_ui::ERROR_TEXT,
+                        format!("{}: {err}", tr(lang, "status.openfailed")),
                     );
                     return;
                 }
-                if self.open_rx.is_some() && self.eb.is_none() {
-                    ui.label("正在读取文件…");
-                    return;
+                if self.open_rx.is_some()
+                    && self
+                        .tabs
+                        .last()
+                        .map(|t| t.is_loading())
+                        .unwrap_or(false)
+                    && self.active == self.tabs.len() - 1
+                {
+                    // 最新打开的 tab 仍在读取头部
                 }
-                let Some(mut eb) = self.eb.take() else {
-                    ui.heading("HiEditor Pro — 大文件编辑器");
-                    ui.label("在上方输入文件路径打开（或在命令行运行: hieditor-gui <文件路径>）");
-                    ui.label("特性: GB 级秒开 · 首屏先行 · 虚拟化渲染 · 并行搜索高亮 · 光标/选区编辑 · Ctrl+Z/Y 撤销重做 · Ctrl+S 保存");
+                let Some(mut tab) = self.eb_take_active() else {
+                    ui.heading("HiEditor Pro");
+                    ui.label(tr(lang, "empty.hint1"));
                     return;
                 };
-                self.render_editor(ui, &mut eb);
-                self.eb = Some(eb);
+                self.render_editor(ui, &mut tab);
+                self.eb_put_back(tab);
             });
+
+        // ---- 设置窗口（模态：500x300，遮罩不可点击，Esc/✕ 关闭）----
+        if self.show_settings {
+            let lang = self.lang;
+            let mut close = false;
+            let modal = egui::Modal::new(egui::Id::new("settings_modal"))
+                .frame(egui::Frame::popup(&ctx.style()).inner_margin(14.0));
+            let resp = modal.show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.set_height(300.0);
+                ui.horizontal(|ui| {
+                    ui.strong(tr(lang, "settings.title"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("×").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "settings.lang"));
+                    ui.radio(self.lang == Lang::Follow, tr(lang, "lang.follow")).clicked().then(|| {
+                        self.lang = Lang::Follow;
+                        save_settings(self.lang, self.theme_mode);
+                    });
+                    ui.radio(self.lang == Lang::Zh, tr(lang, "lang.zh")).clicked().then(|| {
+                        self.lang = Lang::Zh;
+                        save_settings(self.lang, self.theme_mode);
+                    });
+                    ui.radio(self.lang == Lang::En, tr(lang, "lang.en")).clicked().then(|| {
+                        self.lang = Lang::En;
+                        save_settings(self.lang, self.theme_mode);
+                    });
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "settings.theme"));
+                    ui.radio(self.theme_mode == ThemeMode::Light, tr(lang, "theme.light")).clicked().then(|| {
+                        self.theme_mode = ThemeMode::Light;
+                        ctx.set_visuals(egui::Visuals::light());
+                        save_settings(self.lang, self.theme_mode);
+                    });
+                    ui.radio(self.theme_mode == ThemeMode::Dark, tr(lang, "theme.dark")).clicked().then(|| {
+                        self.theme_mode = ThemeMode::Dark;
+                        ctx.set_visuals(egui::Visuals::dark());
+                        save_settings(self.lang, self.theme_mode);
+                    });
+                });
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                if ui.button(tr(lang, "settings.shortcut")).clicked() {
+                    self.status = if create_desktop_shortcut() {
+                        tr(lang, "settings.shortcut_ok").into()
+                    } else {
+                        tr(lang, "settings.shortcut_fail").into()
+                    };
+                }
+            });
+            if resp.should_close() || resp.backdrop_response.clicked() || close {
+                self.show_settings = false;
+            }
+        }
+
+        // ---- 关于窗口（模态：500x300，遮罩不可点击，Esc/✕ 关闭）----
+        if self.show_about {
+            let lang = self.lang;
+            let mut close = false;
+            let modal = egui::Modal::new(egui::Id::new("about_modal"))
+                .frame(egui::Frame::popup(&ctx.style()).inner_margin(14.0));
+            let resp = modal.show(ctx, |ui| {
+                ui.set_width(500.0);
+                ui.set_height(300.0);
+                ui.horizontal(|ui| {
+                    ui.strong(tr(lang, "about.title"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("×").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.add_space(10.0);
+                ui.label(format!(
+                    "HiEditor Pro v{} — {}",
+                    env!("CARGO_PKG_VERSION"),
+                    tr(lang, "about.desc")
+                ));
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(tr(lang, "about.src"));
+                        ui.label("https://github.com/hicode0101/HiTools");
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(tr(lang, "btn.open")).clicked() {
+                            let _ = std::process::Command::new("cmd")
+                                .args(["/C", "start", "", "https://github.com/hicode0101/HiTools"])
+                                .spawn();
+                        }
+                        if ui.button(tr(lang, "btn.copy")).clicked() {
+                            let _ = clipboard_set("https://github.com/hicode0101/HiTools");
+                            self.status = format!("{}: {}", tr(lang, "status.copiedn"), tr(lang, "about.src"));
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(tr(lang, "about.wx"));
+                        ui.label("hicode0101（微信同号）");
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(tr(lang, "btn.copywx")).clicked() {
+                            let _ = clipboard_set("hicode0101");
+                            self.status = format!("{}: {}", tr(lang, "status.copiedn"), tr(lang, "about.wx"));
+                        }
+                    });
+                });
+            });
+            if resp.should_close() || resp.backdrop_response.clicked() || close {
+                self.show_about = false;
+            }
+        }
+
+        // ---- 关闭确认 ----
+        if let Some(idx) = self.confirm_close {
+            if idx < self.tabs.len() {
+                let mut title = self.tabs[idx].title();
+        if title == "无标题" {
+            title = tr(lang, "tab.untitled").into();
+        }
+                egui::Window::new(tr(lang, "confirm.title"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(format!("\"{title}\" {}", tr(lang, "confirm.msg")));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button(tr(lang, "confirm.save")).clicked() {
+                                match self.tabs[idx].eb.save() {
+                                    Ok(()) => self.status = tr(lang, "status.saved").into(),
+                                    Err(e) => self.status = format!("{}: {e}", tr(lang, "status.savefail")),
+                                }
+                                let idx = self.confirm_close.take().unwrap();
+                                if idx < self.tabs.len() {
+                                    self.remove_tab(idx);
+                                }
+                            }
+                            if ui.button(tr(lang, "confirm.nosave")).clicked() {
+                                let idx = self.confirm_close.take().unwrap();
+                                self.remove_tab(idx);
+                            }
+                            if ui.button(tr(lang, "confirm.cancel")).clicked() {
+                                self.confirm_close = None;
+                            }
+                        });
+                    });
+            } else {
+                self.confirm_close = None;
+            }
+        }
+    }
+}
+
+
+// ---------- Tab 附加方法（剪贴板/保存） ----------
+impl Tab {
+    fn paste_from_clipboard(&mut self) -> Option<String> {
+        match clipboard_get() {
+            Some(text) => {
+                self.insert_text(&text);
+                None
+            }
+            None => Some("剪贴板为空或不可用".into()),
+        }
+    }
+
+    fn do_save(&mut self, lang: Lang) -> String {
+        if self.eb.path().as_os_str().is_empty() {
+            return tr(lang, "status.untitlednosave").into();
+        }
+        match self.eb.save() {
+            Ok(()) => format!(
+                "{} {}（{}）",
+                tr(lang, "status.saved"),
+                self.eb.path().display(),
+                fmt_size(self.eb.len())
+            ),
+            Err(e) => format!("{}: {e}", tr(lang, "status.savefail")),
+        }
     }
 }
 
 impl App {
-    fn is_loading(&self) -> bool {
-        self.eb.as_ref().map(|e| !e.has_index()).unwrap_or(false)
-    }
-
-    fn render_editor(&mut self, ui: &mut egui::Ui, eb: &mut EditableBuffer) {
-        let index_ready = eb.has_index();
+    // ---------- 编辑区渲染（作用于当前标签页） ----------
+    #[allow(clippy::too_many_lines)]
+    fn render_editor(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
+        let lang = self.lang;
+        let th = editor_theme(self.theme_mode == ThemeMode::Dark);
+        let index_ready = tab.eb.has_index();
         let n = if index_ready {
-            eb.line_count()
+            tab.eb.line_count()
         } else {
-            self.covered_lines
+            tab.covered_lines
         };
         let line_height = self.font_size * 1.4;
         let avail = ui.available_size();
         let visible = ((avail.y / line_height) as u64).max(1);
-        self.last_visible = visible;
-        self.first_line = self.first_line.min(n.saturating_sub(1));
+        tab.last_visible = visible;
+        tab.first_line = tab.first_line.min(n.saturating_sub(1));
         let wrap = self.wrap;
         if wrap {
-            self.h_scroll = 0.0; // 换行模式无横向滚动
+            tab.h_scroll = 0.0;
         }
 
         // ---- 布局与度量 ----
         let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         let font = egui::FontId::monospace(self.font_size);
-        // 行号栏宽度 = 最大行号位数 × 数字宽 + 窄边距，随行数自动变宽
         let digit_w = ui
-            .fonts(|f| f.layout_no_wrap("0".to_string(), font.clone(), FG))
+            .fonts(|f| f.layout_no_wrap("0".to_string(), font.clone(), theme_ui::TEXT_MEASURE))
             .rect
             .width()
             .max(1.0);
         let digits = format!("{n}").len() as f32;
         let gutter_w = digits * digit_w + 14.0;
-        let text_left = rect.left() + gutter_w;
+        let text_left = rect.left() + gutter_w + 10.0;
         const TRACK: f32 = 14.0;
         let text_w = (rect.right() - text_left - TRACK - 6.0).max(50.0);
         let text_top_pad = (line_height - self.font_size) * 0.42;
 
-        // 文本区宽度变化（窗口缩放）→ 换行行数缓存失效；水平滚动范围收敛
-        if (self.last_wrap_w - text_w).abs() > 0.5 {
-            self.last_wrap_w = text_w;
-            self.wrap_rows.clear();
+        // 文本区宽度变化 → 换行缓存失效
+        if (tab.last_wrap_w - text_w).abs() > 0.5 {
+            tab.last_wrap_w = text_w;
+            tab.wrap_rows.clear();
         }
-        self.h_scroll = self
-            .h_scroll
-            .clamp(0.0, (self.h_extent - text_w).max(0.0));
+        tab.h_scroll = tab.h_scroll.clamp(0.0, (tab.h_extent - text_w).max(0.0));
 
-        // ---- 滚轮（向下滚 = 后面的内容；Shift+滚轮或横向滚 = 水平平移）----
+        // ---- 滚轮 ----
         let scroll_y = ui.input(|i| i.raw_scroll_delta.y);
         let scroll_x = ui.input(|i| i.raw_scroll_delta.x);
         let shift_held = ui.input(|i| i.modifiers.shift);
         let h_delta = -scroll_x - if shift_held { scroll_y } else { 0.0 };
         if !wrap && h_delta != 0.0 {
-            self.h_scroll = (self.h_scroll + h_delta).clamp(0.0, (self.h_extent - text_w).max(0.0));
+            tab.h_scroll =
+                (tab.h_scroll + h_delta).clamp(0.0, (tab.h_extent - text_w).max(0.0));
         } else if scroll_y != 0.0 {
             let dv = (-scroll_y / line_height).trunc() as i64;
             if dv != 0 {
                 if wrap {
                     for _ in 0..dv.abs() {
                         step_visual(
-                            &mut self.wrap_rows, ui, &font, text_w, eb, index_ready,
-                            self.load_starts.as_slice(), self.covered_lines, self.covered_bytes,
-                            n, &mut self.first_line, &mut self.wrap_skip, dv > 0,
+                            &mut tab.wrap_rows, ui, &font, text_w, &tab.eb, index_ready,
+                            tab.load_starts.as_slice(), tab.covered_lines, tab.covered_bytes,
+                            n, &mut tab.first_line, &mut tab.wrap_skip, dv > 0,
                         );
                     }
                 } else {
-                    self.first_line = shift_line(self.first_line, dv, n.saturating_sub(1));
+                    tab.first_line = shift_line(tab.first_line, dv, n.saturating_sub(1));
                 }
             }
         }
 
-        // 换行模式：skip 越界归一（缓存被清/内容变化后）
+        // 换行模式：skip 越界归一
         if wrap {
             loop {
                 let cur = rows_of_line(
-                    &mut self.wrap_rows, ui, &font, text_w, eb, index_ready,
-                    self.load_starts.as_slice(), self.covered_lines, self.covered_bytes,
-                    self.first_line,
+                    &mut tab.wrap_rows, ui, &font, text_w, &tab.eb, index_ready,
+                    tab.load_starts.as_slice(), tab.covered_lines, tab.covered_bytes,
+                    tab.first_line,
                 ) as u64;
-                if self.wrap_skip >= cur && self.first_line + 1 < n {
-                    self.wrap_skip -= cur;
-                    self.first_line += 1;
+                if tab.wrap_skip >= cur && tab.first_line + 1 < n {
+                    tab.wrap_skip -= cur;
+                    tab.first_line += 1;
                 } else {
-                    if self.first_line + 1 >= n {
-                        self.wrap_skip = self.wrap_skip.min(cur.saturating_sub(1));
+                    if tab.first_line + 1 >= n {
+                        tab.wrap_skip = tab.wrap_skip.min(cur.saturating_sub(1));
                     }
                     break;
                 }
             }
         }
 
-        // ---- 滚动条几何（垂直 + 水平；换行模式水平条隐藏）----
+        // ---- 滚动条几何 ----
         let vtrack = egui::Rect::from_min_size(
             egui::Pos2::new(rect.right() - TRACK, rect.top()),
             egui::Vec2::new(TRACK - 2.0, rect.height() - TRACK),
@@ -1211,27 +2470,27 @@ impl App {
         };
         let size_frac = ((visible as f32) / (n.max(1) as f32)).min(1.0);
         let thumb_h = (size_frac * vtrack.height()).clamp(24.0, vtrack.height());
-        let pos_frac = ((self.first_line as f32) / (max_units as f32)).min(1.0);
+        let pos_frac = ((tab.first_line as f32) / (max_units as f32)).min(1.0);
         let thumb_y = vtrack.top() + pos_frac * (vtrack.height() - thumb_h).max(1.0);
 
-        let h_max = (self.h_extent - text_w).max(0.0);
+        let h_max = (tab.h_extent - text_w).max(0.0);
         let htrack = egui::Rect::from_min_size(
             egui::Pos2::new(text_left, rect.bottom() - TRACK),
             egui::Vec2::new(rect.right() - text_left - TRACK, TRACK - 2.0),
         );
         let h_thumb_w = if h_max > 0.0 {
-            (text_w / self.h_extent * htrack.width()).clamp(24.0, htrack.width())
+            (text_w / tab.h_extent * htrack.width()).clamp(24.0, htrack.width())
         } else {
             htrack.width()
         };
         let h_thumb_x = htrack.left()
             + if h_max > 0.0 {
-                (self.h_scroll / h_max) * (htrack.width() - h_thumb_w)
+                (tab.h_scroll / h_max) * (htrack.width() - h_thumb_w)
             } else {
                 0.0
             };
 
-        // ---- 鼠标：滚动条点击/拖拽；内容区点击定位光标、拖拽选区 ----
+        // ---- 鼠标 ----
         let pointer_pos = response.interact_pointer_pos();
         let in_htrack = pointer_pos
             .map(|p| htrack.top() <= p.y && p.x >= text_left && !wrap)
@@ -1243,30 +2502,30 @@ impl App {
                     let p = pointer_pos.unwrap();
                     let denom = (htrack.width() - h_thumb_w).max(1.0);
                     let ratio = ((p.x - htrack.left()) - h_thumb_w / 2.0).max(0.0) / denom;
-                    self.h_scroll = (ratio.clamp(0.0, 1.0) * h_max).min(h_max);
+                    tab.h_scroll = (ratio.clamp(0.0, 1.0) * h_max).min(h_max);
                 }
             } else if in_vtrack {
                 if response.clicked() || response.dragged() {
                     let p = pointer_pos.unwrap();
                     let ratio = ((p.y - vtrack.top()) - thumb_h / 2.0).max(0.0)
                         / (vtrack.height() - thumb_h).max(1.0);
-                    self.first_line = ((ratio.clamp(0.0, 1.0) * max_units as f32) as u64)
+                    tab.first_line = ((ratio.clamp(0.0, 1.0) * max_units as f32) as u64)
                         .min(n.saturating_sub(1));
-                    self.wrap_skip = 0;
+                    tab.wrap_skip = 0;
                 }
             } else {
                 let mut target_at = |pos: egui::Pos2| -> u64 {
                     if wrap {
                         cursor_at_pointer_wrap(
-                            &mut self.wrap_rows, ui, &font, text_w, eb, index_ready,
-                            self.load_starts.as_slice(), self.covered_lines, self.covered_bytes,
-                            n, self.first_line, self.wrap_skip, pos, rect, text_left, line_height,
+                            &mut tab.wrap_rows, ui, &font, text_w, &tab.eb, index_ready,
+                            tab.load_starts.as_slice(), tab.covered_lines, tab.covered_bytes,
+                            n, tab.first_line, tab.wrap_skip, pos, rect, text_left, line_height,
                         )
                     } else {
                         cursor_at_pointer_flat(
-                            self.first_line, n, index_ready, eb, self.load_starts.as_slice(),
-                            self.covered_lines, self.covered_bytes, pos, rect, text_left,
-                            &font, ui, line_height, self.h_scroll,
+                            tab.first_line, n, index_ready, &tab.eb, tab.load_starts.as_slice(),
+                            tab.covered_lines, tab.covered_bytes, pos, rect, text_left,
+                            &font, ui, line_height, tab.h_scroll,
                         )
                     }
                 };
@@ -1275,173 +2534,210 @@ impl App {
                     let extend = ui.input(|i| i.modifiers.shift);
                     let target = target_at(pointer_pos.unwrap_or(rect.min));
                     if extend {
-                        if self.anchor.is_none() {
-                            self.anchor = Some(self.cursor);
+                        if tab.anchor.is_none() {
+                            tab.anchor = Some(tab.cursor);
                         }
-                        self.cursor = target;
+                        tab.cursor = target;
                     } else {
-                        self.cursor = target;
-                        self.anchor = None;
+                        tab.cursor = target;
+                        tab.anchor = None;
                     }
                 }
                 if response.drag_started() {
                     self.editor_focused = true;
                     let target = target_at(pointer_pos.unwrap_or(rect.min));
-                    self.anchor = Some(target);
-                    self.cursor = target;
+                    tab.anchor = Some(target);
+                    tab.cursor = target;
                 }
                 if response.dragged() {
                     if let Some(pos) = pointer_pos {
-                        self.cursor = target_at(pos);
+                        tab.cursor = target_at(pos);
                     }
                 }
-                // 双击：选中包含点击位置的连续非空白段（英文单词/汉字词，遇空格结束）
+                // 双击选词
                 if response.double_clicked() {
                     self.editor_focused = true;
                     let pos_byte = target_at(pointer_pos.unwrap_or(rect.min));
-                    let (ws, we) = word_range_at(eb, pos_byte);
+                    let (ws, we) = word_range_at(&tab.eb, pos_byte);
                     if ws < we {
-                        self.anchor = Some(ws);
-                        self.cursor = we;
+                        tab.anchor = Some(ws);
+                        tab.cursor = we;
                     }
                 }
             }
         }
-        // 编辑键盘焦点保持粘性：右键菜单/滚动条操作不夺走焦点，
-        // 仅当路径/搜索输入框获得焦点时才让出（各自的 has_focus 处理器置 false）
-        if response.secondary_clicked() && !in_vtrack && !in_htrack {
-            self.editor_focused = true; // 右键呼出菜单视为仍在编辑区工作
+        if response.clicked_elsewhere() {
+            self.editor_focused = false;
         }
 
         // ---- 右键上下文菜单 ----
-        if index_ready && !in_vtrack && !in_htrack {
+        if index_ready {
             response.context_menu(|ui| {
-                let can_undo = eb.undo_depth() > 0;
-                let can_redo = eb.redo_depth() > 0;
-                let has_sel = self.sel_range().is_some();
+                ui.set_min_width(160.0);
+                let can_undo = tab.eb.undo_depth() > 0;
+                let can_redo = tab.eb.redo_depth() > 0;
+                let has_sel = tab.sel_range().is_some();
                 let has_clip = clipboard_get().is_some();
                 if ui
-                    .add_enabled(can_undo, egui::Button::new("撤销").shortcut_text("Ctrl+Z"))
+                    .add_enabled(can_undo, egui::Button::new(tr(lang, "edit.undo")).shortcut_text("Ctrl+Z"))
                     .clicked()
                 {
-                    self.do_undo(eb);
+                    tab.do_undo();
                 }
                 if ui
-                    .add_enabled(can_redo, egui::Button::new("恢复").shortcut_text("Ctrl+Y"))
+                    .add_enabled(can_redo, egui::Button::new(tr(lang, "edit.redo")).shortcut_text("Ctrl+Y"))
                     .clicked()
                 {
-                    self.do_redo(eb);
+                    tab.do_redo();
                 }
                 ui.separator();
                 if ui
-                    .add_enabled(eb.len() > 0, egui::Button::new("全选").shortcut_text("Ctrl+A"))
+                    .add_enabled(
+                        tab.eb.len() > 0,
+                        egui::Button::new(tr(lang, "edit.selectall")).shortcut_text("Ctrl+A"),
+                    )
                     .clicked()
                 {
-                    self.anchor = Some(0);
-                    self.cursor = eb.len();
+                    tab.anchor = Some(0);
+                    tab.cursor = tab.eb.len();
                 }
                 if ui
-                    .add_enabled(has_sel, egui::Button::new("剪切").shortcut_text("Ctrl+X"))
+                    .add_enabled(has_sel, egui::Button::new(tr(lang, "edit.cut")).shortcut_text("Ctrl+X"))
                     .clicked()
                 {
-                    self.cut_selection(eb);
+                    if let Some(n) = tab.cut_selection() {
+                        self.status = format!("{} {n}", tr(lang, "status.cutn"));
+                    }
                 }
                 if ui
-                    .add_enabled(has_sel, egui::Button::new("复制").shortcut_text("Ctrl+C"))
+                    .add_enabled(has_sel, egui::Button::new(tr(lang, "edit.copy")).shortcut_text("Ctrl+C"))
                     .clicked()
                 {
-                    self.copy_selection_to_clipboard(eb);
+                    if let Some(n) = tab.copy_selection() {
+                        self.status = format!("{} {n}", tr(lang, "status.copiedn"));
+                    }
                 }
                 if ui
-                    .add_enabled(has_clip, egui::Button::new("粘贴").shortcut_text("Ctrl+V"))
+                    .add_enabled(has_clip, egui::Button::new(tr(lang, "edit.paste")).shortcut_text("Ctrl+V"))
                     .clicked()
                 {
-                    self.paste_from_clipboard(eb);
+                    if let Some(msg) = tab.paste_from_clipboard() {
+                        self.status = msg;
+                    }
                 }
                 if ui
-                    .add_enabled(has_sel, egui::Button::new("删除").shortcut_text("Del"))
+                    .add_enabled(has_sel, egui::Button::new(tr(lang, "edit.delete")).shortcut_text("Del"))
                     .clicked()
                 {
-                    self.delete_selection(eb);
+                    tab.delete_selection();
                 }
                 ui.separator();
-                if ui.add_enabled(has_sel, egui::Button::new("转大写")).clicked() {
-                    self.transform_selection(eb, CaseMode::Upper);
+                if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.upper"))).clicked() {
+                    tab.transform_selection(CaseMode::Upper);
                 }
-                if ui.add_enabled(has_sel, egui::Button::new("转小写")).clicked() {
-                    self.transform_selection(eb, CaseMode::Lower);
+                if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.lower"))).clicked() {
+                    tab.transform_selection(CaseMode::Lower);
                 }
                 if ui
-                    .add_enabled(has_sel, egui::Button::new("首字母大写其余小写"))
+                    .add_enabled(has_sel, egui::Button::new(tr(lang, "edit.title")))
                     .clicked()
                 {
-                    self.transform_selection(eb, CaseMode::Title);
+                    tab.transform_selection(CaseMode::Title);
                 }
             });
         }
 
-        // ---- 键盘（编辑区持有焦点且索引就绪时）----
+        // ---- 键盘 ----
         if self.editor_focused && index_ready {
             let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
             for ev in events {
                 match ev {
                     egui::Event::Text(t) => {
                         if !t.is_empty() {
-                            self.insert_text(eb, &t);
+                            tab.insert_text(&t);
                         }
                     }
                     egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
-                        // 输入法上屏（中文/日文/韩文等）
                         if !text.is_empty() {
-                            self.insert_text(eb, &text);
+                            tab.insert_text(&text);
                         }
                     }
-                    // Ctrl+C/X/V 被 egui-winit 转换为以下事件（原始 Key 已被吞掉）
-                    egui::Event::Copy => self.copy_selection_to_clipboard(eb),
-                    egui::Event::Cut => self.cut_selection(eb),
+                    egui::Event::Copy => {
+                        if let Some(n) = tab.copy_selection() {
+                            self.status = format!("{} {n}", tr(lang, "status.copiedn"));
+                        }
+                    }
+                    egui::Event::Cut => {
+                        if let Some(n) = tab.cut_selection() {
+                            self.status = format!("{} {n}", tr(lang, "status.cutn"));
+                        }
+                    }
                     egui::Event::Paste(text) => {
                         if !text.is_empty() {
-                            self.insert_text(eb, &text);
+                            tab.insert_text(&text);
                         }
                     }
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
                         let extend = modifiers.shift;
                         match key {
-                            egui::Key::ArrowLeft => self.move_cursor(eb, prev_boundary(eb, self.cursor), extend),
-                            egui::Key::ArrowRight => self.move_cursor(eb, next_boundary(eb, self.cursor), extend),
-                            egui::Key::ArrowUp => self.move_line(eb, -1, extend),
-                            egui::Key::ArrowDown => self.move_line(eb, 1, extend),
-                            egui::Key::PageUp => self.move_line(eb, -((visible * 9 / 10) as i64), extend),
-                            egui::Key::PageDown => self.move_line(eb, (visible * 9 / 10) as i64, extend),
+                            egui::Key::ArrowLeft => tab.move_cursor(prev_boundary(&tab.eb, tab.cursor), extend),
+                            egui::Key::ArrowRight => tab.move_cursor(next_boundary(&tab.eb, tab.cursor), extend),
+                            egui::Key::ArrowUp => tab.move_line(-1, extend),
+                            egui::Key::ArrowDown => tab.move_line(1, extend),
+                            egui::Key::PageUp => tab.move_line(-((visible * 9 / 10) as i64), extend),
+                            egui::Key::PageDown => tab.move_line((visible * 9 / 10) as i64, extend),
                             egui::Key::Home => {
                                 let target = if modifiers.ctrl {
                                     0
                                 } else {
-                                    eb.start_of_line(eb.line_of_offset(self.cursor))
+                                    tab.eb.start_of_line(tab.eb.line_of_offset(tab.cursor))
                                 };
-                                self.move_cursor(eb, target, extend);
+                                tab.move_cursor(target, extend);
                             }
                             egui::Key::End => {
                                 let target = if modifiers.ctrl {
-                                    eb.len()
+                                    tab.eb.len()
                                 } else {
-                                    line_content_end(eb, eb.line_of_offset(self.cursor))
+                                    line_content_end(&tab.eb, tab.eb.line_of_offset(tab.cursor))
                                 };
-                                self.move_cursor(eb, target, extend);
+                                tab.move_cursor(target, extend);
                             }
-                            egui::Key::Backspace => self.delete_at_cursor(eb, false),
-                            egui::Key::Delete => self.delete_at_cursor(eb, true),
-                            egui::Key::Enter => self.insert_text(eb, "\n"),
-                            egui::Key::Tab => self.insert_text(eb, "\t"),
-                            egui::Key::Z if modifiers.ctrl && !modifiers.shift => self.do_undo(eb),
-                            egui::Key::Y if modifiers.ctrl => self.do_redo(eb),
-                            egui::Key::Z if modifiers.ctrl && modifiers.shift => self.do_redo(eb),
-                            egui::Key::S if modifiers.ctrl => {
-                                self.status = Self::do_save(eb);
-                            }
+                            egui::Key::Backspace => tab.delete_at_cursor(false),
+                            egui::Key::Delete => tab.delete_at_cursor(true),
+                            egui::Key::Enter => tab.insert_text("\n"),
+                            egui::Key::Tab => tab.insert_text("\t"),
+                            egui::Key::Z if modifiers.ctrl && !modifiers.shift => tab.do_undo(),
+                            egui::Key::Y if modifiers.ctrl => tab.do_redo(),
+                            egui::Key::Z if modifiers.ctrl && modifiers.shift => tab.do_redo(),
                             egui::Key::A if modifiers.ctrl => {
-                                self.anchor = Some(0);
-                                self.cursor = eb.len();
+                                tab.anchor = Some(0);
+                                tab.cursor = tab.eb.len();
+                            }
+                            egui::Key::C if modifiers.ctrl => {
+                                if let Some(n) = tab.copy_selection() {
+                                    self.status = format!("{} {n}", tr(lang, "status.copiedn"));
+                                }
+                            }
+                            egui::Key::X if modifiers.ctrl => {
+                                if let Some(n) = tab.cut_selection() {
+                                    self.status = format!("{} {n}", tr(lang, "status.cutn"));
+                                }
+                            }
+                            egui::Key::V if modifiers.ctrl => {
+                                if let Some(msg) = tab.paste_from_clipboard() {
+                                    self.status = msg;
+                                }
+                            }
+                            egui::Key::S if modifiers.ctrl => {
+                                self.status = tab.do_save(lang);
+                            }
+                            egui::Key::F if modifiers.ctrl => {
+                                self.show_find = true;
+                                self.show_replace = false;
+                            }
+                            egui::Key::H if modifiers.ctrl => {
+                                self.show_find = true;
+                                self.show_replace = true;
                             }
                             _ => {}
                         }
@@ -1451,17 +2747,38 @@ impl App {
             }
         }
 
-        // ---- 定位工具（光标/选区/命中 → 视觉坐标；换行模式多行，非换行单行）----
-        let prefix_w = |text: &str, byte: usize| -> f32 {
-            let seg = safe_slice(text, 0..byte);
-            ui.fonts(|f| f.layout_no_wrap(seg, font.clone(), FG)).rect.width()
-        };
+        // ---- 光标滚动跟随：仅在光标移动过时触发（滚轮浏览不被拉回）----
+        let cursor_moved = tab.cursor != tab.last_cursor;
+        if index_ready && cursor_moved {
+            let cursor_line = tab.eb.line_of_offset(tab.cursor);
+            if cursor_line < tab.first_line || cursor_line >= tab.first_line + visible {
+                tab.first_line = cursor_line.saturating_sub(visible / 4);
+                tab.wrap_skip = 0;
+            }
+        }
+        tab.last_cursor = tab.cursor;
+
+        // ---- 绘制可视内容 ----
+        let sel = tab.sel_range();
+        let hits = tab.search.hits.clone();
+        let selected_offset = hits.get(tab.search.selected).map(|h| h.offset);
+        let cursor = tab.cursor;
+        let cursor_line_visible = self.editor_focused && index_ready;
+        let cursor_line = if index_ready { tab.eb.line_of_offset(cursor) } else { 0 };
+        let eb = &tab.eb;
+        let load_starts = tab.load_starts.as_slice();
+        let covered_lines = tab.covered_lines;
+        let covered_bytes = tab.covered_bytes;
+        let h_scroll = tab.h_scroll;
+
         let pos_in_line = |text: &str, byte: usize| -> (u32, f32) {
             if !wrap {
-                return (0, prefix_w(text, byte));
+                let seg = safe_slice(text, 0..byte);
+                let w = ui.fonts(|f| f.layout_no_wrap(seg, font.clone(), theme_ui::TEXT_MEASURE)).rect.width();
+                return (0, w);
             }
             let prefix = safe_slice(text, 0..byte);
-            let g = ui.fonts(|f| f.layout(prefix, font.clone(), FG, text_w));
+            let g = ui.fonts(|f| f.layout(prefix, font.clone(), theme_ui::TEXT_MEASURE, text_w));
             let r = g.rows.len().saturating_sub(1);
             let x = g.rows.get(r).map(|row| row.rect().right()).unwrap_or(0.0);
             (r as u32, x)
@@ -1478,95 +2795,32 @@ impl App {
             out
         };
 
-        // ---- 光标滚动跟随：仅在光标移动过时触发（滚轮浏览不再被拉回）----
-        let cursor_moved = self.cursor != self.last_cursor;
-        if index_ready && cursor_moved {
-            let cursor_line = eb.line_of_offset(self.cursor);
-            // 垂直
-            if wrap {
-                if cursor_line < self.first_line {
-                    self.first_line = cursor_line;
-                    self.wrap_skip = 0;
-                } else if cursor_line > self.first_line {
-                    let dist = cursor_line - self.first_line;
-                    if dist > visible * 4 {
-                        self.first_line = cursor_line.saturating_sub(visible / 4).min(cursor_line);
-                        self.wrap_skip = 0;
-                    } else {
-                        let cache = &mut self.wrap_rows;
-                        let mut acc: i64 = -(self.wrap_skip as i64);
-                        let mut ln = self.first_line;
-                        while ln < cursor_line {
-                            acc += rows_of_line(
-                                cache, ui, &font, text_w, eb, index_ready,
-                                self.load_starts.as_slice(), self.covered_lines, self.covered_bytes,
-                                ln,
-                            ) as i64;
-                            ln += 1;
-                        }
-                        if acc < 0 || (acc as u64) + 1 >= visible {
-                            self.first_line = cursor_line.saturating_sub(visible / 4).min(cursor_line);
-                            self.wrap_skip = 0;
-                        }
-                    }
-                }
-            } else if cursor_line < self.first_line || cursor_line >= self.first_line + visible {
-                self.first_line = cursor_line.saturating_sub(visible / 4);
-            }
-            // 水平（非换行模式）：光标超出视口时平移
-            if !wrap {
-                let (cs, ce) = line_bounds_at(
-                    index_ready, eb, self.load_starts.as_slice(),
-                    self.covered_lines, self.covered_bytes, cursor_line,
-                );
-                let len = ((ce - cs) as usize).min(MAX_LINE_BYTES);
-                let mut buf = vec![0u8; len];
-                let _ = eb.read(cs, &mut buf);
-                let mut v: &[u8] = &buf;
-                while let Some(&l) = v.last() {
-                    if l == b'\n' || l == b'\r' {
-                        v = &v[..v.len() - 1];
-                    } else {
-                        break;
-                    }
-                }
-                let line_text = String::from_utf8_lossy(v).into_owned();
-                let rel = ((self.cursor - cs) as usize).min(line_text.len());
-                let (_, cx) = pos_in_line(&line_text, rel);
-                if cx < self.h_scroll {
-                    self.h_scroll = (cx - text_w * 0.1).max(0.0);
-                } else if cx - self.h_scroll > text_w - 40.0 {
-                    self.h_scroll = (cx - text_w * 0.9).clamp(0.0, (self.h_extent - text_w).max(0.0));
-                }
-            }
-        }
-        self.last_cursor = self.cursor;
-
-        // ---- 绘制可视内容 ----
-        let sel = self.sel_range();
-        let hits = self.search.hits.clone();
-        let selected_offset = hits.get(self.search.selected).map(|h| h.offset);
-        let cursor = self.cursor;
-        let cursor_line_visible = self.editor_focused && index_ready;
-        let cursor_line = if index_ready { eb.line_of_offset(cursor) } else { 0 };
-        let eb = &*eb;
-        let load_starts = self.load_starts.as_slice();
-        let covered_lines = self.covered_lines;
-        let covered_bytes = self.covered_bytes;
-        let h_scroll = self.h_scroll;
+        // 行号栏浅灰底 + 分隔线
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::Vec2::new(gutter_w, rect.height())),
+            0.0,
+            th.gutter_bg,
+        );
+        painter.line_segment(
+            [
+                egui::Pos2::new(gutter_w - 1.0, rect.top()),
+                egui::Pos2::new(gutter_w - 1.0, rect.bottom()),
+            ],
+            egui::Stroke::new(1.0_f32, th.gutter_sep),
+        );
 
         let mut y = if wrap {
-            rect.top() - self.wrap_skip as f32 * line_height
+            rect.top() - tab.wrap_skip as f32 * line_height
         } else {
             rect.top()
         };
-        let mut line = self.first_line;
+        let mut line = tab.first_line;
         let mut max_w_seen = text_w;
         loop {
             let done = if wrap {
                 y >= rect.bottom() - TRACK || line >= n
             } else {
-                line >= n || line >= self.first_line + visible
+                line >= n || line >= tab.first_line + visible
             };
             if done {
                 break;
@@ -1576,26 +2830,17 @@ impl App {
                 read_line_text(eb, index_ready, load_starts, covered_lines, covered_bytes, line);
             let text_bytes = text.len();
 
-            // 行号（右对齐，窄边距；固定不随水平滚动；1 起始显示）
+            // 行号（1 起始显示）
             let num =
-                ui.fonts(|f| f.layout_no_wrap(format!("{}", line + 1), font.clone(), GUTTER_FG));
+                ui.fonts(|f| f.layout_no_wrap(format!("{}", line + 1), font.clone(), th.gutter_fg));
             painter.galley(
-                egui::Pos2::new(text_left - 8.0 - num.rect.width(), y + text_top_pad),
+                egui::Pos2::new(
+                    gutter_w - 8.0 - num.rect.width(),
+                    y + text_top_pad,
+                ),
                 num,
-                GUTTER_FG,
+                th.gutter_fg,
             );
-
-            // 整行文本 galley（换行模式按 text_w 折行）
-            let galley = if wrap {
-                ui.fonts(|f| f.layout(text.clone(), font.clone(), FG, text_w))
-            } else {
-                ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), FG))
-            };
-            let rows_used = galley.rows.len().max(1) as u32;
-            let galley_w = galley.rect.width();
-
-            // 内容水平偏移：屏幕x = text_left + 内容x - h_scroll
-            let ox = |x: f32| -> f32 { text_left + x - h_scroll };
 
             // 选区底色
             if let Some((ss, se)) = sel {
@@ -1606,11 +2851,11 @@ impl App {
                     for (r, xf, xt) in span_rows(&text, (a - s) as usize, (b - s) as usize) {
                         painter.rect_filled(
                             egui::Rect::from_min_size(
-                                egui::Pos2::new(ox(xf), y + r as f32 * line_height),
+                                egui::Pos2::new(text_left + xf - h_scroll, y + r as f32 * line_height),
                                 egui::Vec2::new((xt - xf).max(2.0), line_height),
                             ),
                             0.0,
-                            SELECTION_BG,
+                            th.sel,
                         );
                     }
                 }
@@ -1629,21 +2874,35 @@ impl App {
                 for (r, xf, xt) in span_rows(&text, (h.offset - s) as usize, (b - s) as usize) {
                     painter.rect_filled(
                         egui::Rect::from_min_size(
-                            egui::Pos2::new(ox(xf), y + r as f32 * line_height),
+                            egui::Pos2::new(
+                                text_left + xf - h_scroll,
+                                y + r as f32 * line_height,
+                            ),
                             egui::Vec2::new((xt - xf).max(2.0), line_height),
                         ),
                         2.0,
                         if selected_offset == Some(h.offset) {
-                            SELECTED_BG
+                            th.selected
                         } else {
-                            HIGHLIGHT_BG
+                            th.highlight
                         },
                     );
                 }
             }
 
-            // 文本
-            painter.galley(egui::Pos2::new(ox(0.0), y + text_top_pad), galley, FG);
+            // 整行文本
+            let galley = if wrap {
+                ui.fonts(|f| f.layout(text.clone(), font.clone(), th.text, text_w))
+            } else {
+                ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), th.text))
+            };
+            let rows_used = galley.rows.len().max(1) as u32;
+            let galley_w = galley.rect.width();
+            painter.galley(
+                egui::Pos2::new(text_left - h_scroll, y + text_top_pad),
+                galley,
+                th.text,
+            );
             if !wrap {
                 max_w_seen = max_w_seen.max(galley_w);
             }
@@ -1655,29 +2914,28 @@ impl App {
                     f.layout_no_wrap(
                         " …截断".to_string(),
                         egui::FontId::monospace(self.font_size * 0.9),
-                        GUTTER_FG,
+                        th.gutter_fg,
                     )
                 });
                 painter.galley(
                     egui::Pos2::new(
-                        ox(tx) + 4.0,
+                        text_left + tx - h_scroll + 4.0,
                         y + tr as f32 * line_height + text_top_pad,
                     ),
                     g,
-                    GUTTER_FG,
+                    th.gutter_fg,
                 );
             }
 
-            // 光标条
+            // 光标条 + IME 锚点
             if cursor_line_visible && cursor_line == line {
                 let rel = ((cursor - s) as usize).min(text_bytes);
                 let (r, x) = pos_in_line(&text, rel);
                 let cursor_rect = egui::Rect::from_min_size(
-                    egui::Pos2::new(ox(x), y + r as f32 * line_height),
+                    egui::Pos2::new(text_left + x - h_scroll, y + r as f32 * line_height),
                     egui::Vec2::new(2.0, line_height),
                 );
-                painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
-                // 上报 IME 锚点：egui-winit 据此 set_ime_allowed(true) 并定位候选窗
+                painter.rect_filled(cursor_rect, 0.0, th.cursor);
                 ui.ctx().output_mut(|o| {
                     o.ime = Some(egui::output::IMEOutput {
                         rect: cursor_rect.expand(2.0),
@@ -1689,10 +2947,9 @@ impl App {
             y += rows_used as f32 * line_height;
             line += 1;
         }
-        self.h_extent = max_w_seen;
 
         // ---- 垂直滚动条 ----
-        painter.rect_filled(vtrack, 2.0, egui::Color32::from_rgb(40, 40, 46));
+        painter.rect_filled(vtrack, 2.0, th.track);
         if size_frac < 1.0 {
             painter.rect_filled(
                 egui::Rect::from_min_size(
@@ -1700,39 +2957,36 @@ impl App {
                     egui::Vec2::new(vtrack.width() - 2.0, thumb_h),
                 ),
                 3.0,
-                egui::Color32::from_rgb(110, 110, 130),
+                th.thumb,
             );
         }
 
-        // ---- 水平滚动条（非换行且内容超宽时出现）----
+        // ---- 水平滚动条 ----
         if !wrap && h_max > 0.0 {
-            painter.rect_filled(htrack, 2.0, egui::Color32::from_rgb(40, 40, 46));
+            painter.rect_filled(htrack, 2.0, th.track);
             painter.rect_filled(
                 egui::Rect::from_min_size(
                     egui::Pos2::new(h_thumb_x + 1.0, htrack.top()),
                     egui::Vec2::new(h_thumb_w - 2.0, htrack.height()),
                 ),
                 3.0,
-                egui::Color32::from_rgb(110, 110, 130),
+                th.thumb,
             );
         }
 
         // ---- 索引进度角标 ----
         if !index_ready {
-            let pct = if self.load_total > 0 {
-                (self.covered_bytes * 100 / self.load_total).min(100)
+            let pct = if tab.load_total > 0 {
+                (tab.covered_bytes * 100 / tab.load_total).min(100)
             } else {
                 0
             };
             painter.text(
                 egui::Pos2::new(rect.right() - TRACK - 12.0, rect.top() + 8.0),
                 egui::Align2::RIGHT_TOP,
-                format!(
-                    "⏳ 行索引构建中 {}%（顺序读盘）— 内容随加载可浏览，完成后可编辑与搜索",
-                    pct
-                ),
+                trf(lang, "editor.indexing", &[&pct.to_string()]),
                 egui::FontId::proportional(13.0),
-                egui::Color32::from_rgb(240, 200, 120),
+                theme_ui::INDEXING_BADGE,
             );
         }
     }
