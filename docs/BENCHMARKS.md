@@ -1,6 +1,6 @@
-# HiEditorPro Phase 1 验收报告
+# HiEditorPro 验收报告
 
-日期：2026-09-12 ｜ 版本：内核 v0.1（commit 于工作区）
+日期：2026-09-12 ｜ 版本：内核 v0.2（Phase 1 只读内核 + Phase 2 编辑增量层）
 
 ## 环境
 
@@ -62,8 +62,8 @@
 ## 四、criterion 基准（256MB 固定文件，防回退）
 
 ```
-lineindex/build_256mb_mmap       time: [41.7 ms 42.1 ms 42.5 ms]  thrpt: 5.94 GiB/s
-lineindex/build_256mb_readfile   time: [91.3 ms 92.1 ms 92.9 ms]  thrpt: 2.71 GiB/s
+lineindex/build_256mb_mmap       time: [41.0 ms 41.4 ms 41.7 ms]  thrpt: 6.04 GiB/s
+lineindex/build_256mb_readfile   time: [92.3 ms 100.3 ms 112.8 ms] thrpt: 2.49 GiB/s
 jump_to_line (5 次跳行/迭代)      time: [9.75 µs  9.77 µs  9.80 µs]  （≈2 µs/次）
 search/literal_cs_256mb          time: [42.3 ms 42.6 ms 43.0 ms]  thrpt: 5.86 GiB/s
 search/literal_ci_256mb          time: [109.1 ms 109.8 ms 110.5 ms] thrpt: 2.28 GiB/s
@@ -72,6 +72,23 @@ search/literal_ci_256mb          time: [109.1 ms 109.8 ms 110.5 ms] thrpt: 2.28 
 **存储后端决策（架构文档补丁 4）**：本地盘索引扫描 mmap 比 ReadFile 分块快 **2.2×**
 （42ms vs 92ms；后者含每次读打开句柄的开销）。结论：本地文件默认 MmapBase，
 网络/可移动介质才降级 ChunkedBase——与架构决策一致。
+
+## 四·补、编辑层实测（Phase 2，5GB / 4474 万行）
+
+| 操作 | 耗时 | 说明 |
+|---|---|---|
+| 行首插入 34 字节（行 2000 万处） | **0.37 ms** | 与文件大小无关 |
+| 偏移 30 亿处插入 12 字节 | **0.27 ms** | 同上 |
+| 删除 4096 字节（37 行） | **0.33 ms** | 同上 |
+| 另存为 5GB（流式临时文件+原子替换+重索引） | 196 s | 机械盘顺序写 ≈26MB/s，磁盘瓶颈 |
+| 编辑后内存增量 | commit ≈ 0 | 仅 piece 表 + 间距块 Arc 共享 |
+
+- 编辑耗时与文件大小解耦（splice 只触碰边界块，O(块数) 指针操作）；
+  对照早期实现的 115ms/次（整块克隆），优化 300+ 倍。
+- 行数精确性：5GB 上 +1/+1/−37 三次编辑后 44,739,060 行，与参考模型一致。
+- 正确性保障：随机化对拍测试（300 步随机插入/删除 vs `Vec<u8>` 参考模型，
+  校验内容/随机读/行索引/撤销重做）+ 边界用例（空文件、删至空、EOF 插入、
+  删换行合并行、BOM 流、保存往返）共 31 项测试全绿。
 
 ## 五、内存口径（commit vs working set）
 
@@ -95,9 +112,10 @@ hieditor-cli search testfiles/test_5gb.log alpha --show 20   # ANSI 高亮
 hieditor-gui    testfiles/test_5gb.log                       # GUI 预览：虚拟化浏览 + 关键词高亮
 ```
 
-## 七、已知限制（Phase 1 明确范围外）
+## 七、已知限制
 
-1. 冷盘首开受机械盘 I/O 限制（对策：首屏先行 + 增量索引，接口已预留）
-2. 编码仅 UTF-8/ASCII 可索引搜索（UTF-16/ANSI 检测后拒绝，解码路径二期）
-3. 搜索词含换行不支持；正则未接入（`regex` crate 二期）
-4. 只读；编辑层（piece table + 撤销 + 保存管线）为 Phase 2 主体
+1. 冷盘首开受机械盘 I/O 限制（5GB 冷盘实测 ~122s ≈ 42MB/s；对策：首屏先行 + 增量索引，接口已预留）
+2. 编码仅 UTF-8/ASCII 可索引/搜索/编辑（UTF-16/ANSI 检测后拒绝，解码路径待做）
+3. 搜索词含换行不支持；正则未接入（`regex` crate 待做）
+4. 编辑层已就绪（piece table + 撤销/重做 + 保存管线）；GUI 编辑输入（光标/选区/IME）待做
+5. 保存要求基座 Arc 独占（后台搜索持有时原位替换会拒绝，请另存）；崩溃恢复日志待做

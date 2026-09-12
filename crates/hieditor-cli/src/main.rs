@@ -6,6 +6,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use hieditor_core::document::{Document, OpenOptions};
+use hieditor_core::edit::EditableBuffer;
 use hieditor_core::sysinfo;
 use hieditor_core::util::{fmt_size, parse_size};
 use hieditor_search::{SearchJob, SearchQuery, SearchHit};
@@ -76,6 +77,36 @@ enum Cmd {
         #[arg(long, default_value_t = 42)]
         seed: u64,
     },
+    /// 编辑文件（piece table 增量层：插入/删除/撤销/重做/保存）
+    Edit {
+        path: PathBuf,
+        /// 在指定行首插入文本（需 --text）
+        #[arg(long)]
+        insert_line: Option<u64>,
+        /// 在指定字节偏移插入文本（需 --text）
+        #[arg(long)]
+        insert_at: Option<u64>,
+        /// 插入的文本（支持 \n \t 转义；多个插入操作按出现顺序取用）
+        #[arg(long)]
+        text: Vec<String>,
+        /// 删除：<起点> <长度>（字节）
+        #[arg(long, num_args = 2, value_names = ["POS", "LEN"])]
+        delete: Option<Vec<u64>>,
+        /// 撤销次数
+        #[arg(long, default_value_t = 0)]
+        undo: u64,
+        /// 重做次数
+        #[arg(long, default_value_t = 0)]
+        redo: u64,
+        /// 保存（原位替换；先释放基座映射再原子替换）
+        #[arg(long)]
+        save: bool,
+        /// 另存为（不改动原文件）
+        #[arg(long)]
+        save_as: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -88,6 +119,9 @@ fn main() -> Result<()> {
         }
         Cmd::Gen { output, size, line_min, line_max, long_count, long_size, seed } => {
             cmd_gen(&output, &size, line_min, line_max, long_count, &long_size, seed)
+        }
+        Cmd::Edit { path, insert_line, insert_at, text, delete, undo, redo, save, save_as, threads } => {
+            cmd_edit(&path, insert_line, insert_at, text, delete, undo, redo, save, save_as, threads)
         }
     }
 }
@@ -295,6 +329,132 @@ fn cmd_search(path: &PathBuf, needle: &str, ignore_case: bool, show: usize, max:
         if hits.len() > show {
             println!("  … 共 {} 条", hits.len());
         }
+    }
+    Ok(())
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("\\n", "\n").replace("\\t", "\t")
+}
+
+fn cmd_edit(
+    path: &PathBuf,
+    insert_line: Option<u64>,
+    insert_at: Option<u64>,
+    texts: Vec<String>,
+    delete: Option<Vec<u64>>,
+    undo: u64,
+    redo: u64,
+    save: bool,
+    save_as: Option<PathBuf>,
+    threads: usize,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let mut eb = EditableBuffer::open(path, &open_opts(threads))
+        .with_context(|| format!("打开失败: {}", path.display()))?;
+    println!(
+        "打开: {}（{}, {} 行, 后端 {}, 索引 {} ms）",
+        eb.path().display(),
+        fmt_size(eb.len()),
+        eb.line_count(),
+        eb.backend(),
+        t0.elapsed().as_millis()
+    );
+
+    let mut ops = 0u32;
+    let mut texts = texts.into_iter();
+    if let Some(line) = insert_line {
+        let t = texts.next().context("--insert-line 需要 --text")?;
+        let pos = eb.start_of_line(line);
+        let t1 = Instant::now();
+        let info = eb.insert(pos, unescape(&t).as_bytes())?;
+        println!(
+            "插入 @行 {line}（偏移 {pos}）: {} 字节，行数 {:+}，耗时 {:.2} ms",
+            info.new_len,
+            info.lines_delta,
+            t1.elapsed().as_secs_f64() * 1e3
+        );
+        ops += 1;
+    }
+    if let Some(pos) = insert_at {
+        let t = texts.next().context("--insert-at 需要 --text")?;
+        let t1 = Instant::now();
+        let info = eb.insert(pos, unescape(&t).as_bytes())?;
+        println!(
+            "插入 @偏移 {pos}: {} 字节，行数 {:+}，耗时 {:.2} ms",
+            info.new_len,
+            info.lines_delta,
+            t1.elapsed().as_secs_f64() * 1e3
+        );
+        ops += 1;
+    }
+    if let Some(d) = delete {
+        if d.len() != 2 {
+            bail!("--delete 需要 <起点> <长度> 两个参数");
+        }
+        let t1 = Instant::now();
+        let info = eb.delete(d[0], d[1])?;
+        println!(
+            "删除 @{} 长 {}: 行数 {:+}，耗时 {:.2} ms",
+            d[0],
+            d[1],
+            info.lines_delta,
+            t1.elapsed().as_secs_f64() * 1e3
+        );
+        ops += 1;
+    }
+    for _ in 0..undo {
+        if !eb.undo() {
+            bail!("撤销栈已空");
+        }
+    }
+    if undo > 0 {
+        println!("撤销 ×{undo} 完成");
+        ops += 1;
+    }
+    for _ in 0..redo {
+        if !eb.redo() {
+            bail!("重做栈已空");
+        }
+    }
+    if redo > 0 {
+        println!("重做 ×{redo} 完成");
+        ops += 1;
+    }
+    if ops == 0 {
+        bail!("未指定任何编辑操作（--insert-line / --insert-at / --delete / --undo / --redo）");
+    }
+
+    println!(
+        "当前: {} 字节，{} 行，撤销栈 {}，重做栈 {}，dirty {}",
+        fmt_size(eb.len()),
+        eb.line_count(),
+        eb.undo_depth(),
+        eb.redo_depth(),
+        eb.is_dirty()
+    );
+    print_mem(false);
+    sysinfo::trim_working_set();
+    print_mem(true);
+
+    if save {
+        let t1 = Instant::now();
+        eb.save().with_context(|| "保存失败")?;
+        println!(
+            "保存（原位替换）: {}，耗时 {:.2} s",
+            fmt_size(eb.len()),
+            t1.elapsed().as_secs_f64()
+        );
+    }
+    if let Some(out) = save_as {
+        let t1 = Instant::now();
+        eb.save_as(&out).with_context(|| "另存为失败")?;
+        println!(
+            "另存为 {}: {}，耗时 {:.2} s（重基座+重索引完成，撤销栈已清空）",
+            out.display(),
+            fmt_size(eb.len()),
+            t1.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }

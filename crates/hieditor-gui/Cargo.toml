@@ -11,4 +11,5 @@ path = "src/main.rs"
 [dependencies]
 hieditor-core = { path = "../hieditor-core" }
 hieditor-search = { path = "../hieditor-search" }
+memchr = "2.7"
 eframe = { workspace = true }
