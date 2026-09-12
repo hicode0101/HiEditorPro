@@ -45,6 +45,15 @@ hieditor-cli edit test.log --insert-line 100 --text "new line\n" --save-as out.l
 hieditor-gui test.log
 ```
 
+## 自定义字体
+
+在 `hieditor-gui.exe` 旁边新建 `fonts` 文件夹，放入字体文件后启动程序，
+字体家族名会自动出现在编辑区上方工具栏的"字体"下拉列表中：
+
+- 支持 `.ttf` / `.otf` / `.ttc`（ttc 集合内的每个字体面都会列出，同名去重）
+- 字体名从字体文件内部的 `name` 表解析（非文件名），中文显示名可正常识别
+- 无法识别的文件启动时会在状态栏提示数量；`.woff/.woff2` 为网页格式，不支持
+
 ## Crate 结构
 
 | crate | 职责 |

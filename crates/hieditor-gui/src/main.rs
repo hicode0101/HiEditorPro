@@ -27,6 +27,11 @@ use std::time::Duration;
 mod theme;
 use theme::{editor_theme, ui as theme_ui};
 
+// ---------- 用户字体目录 ----------
+// 扫描 exe 旁 fonts/ 下的 ttf/otf/ttc，解析家族名并入字体下拉
+mod fonts;
+use fonts::UserFont;
+
 /// 每行渲染字节上限（超长行截断显示）
 const MAX_LINE_BYTES: usize = 80_000;
 /// GUI 搜索命中上限
@@ -140,6 +145,8 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "toolbar.font") => if zh { "字体" } else { "Font" },
         (_, "toolbar.size") => if zh { "字号" } else { "Size" },
         (_, "font.default") => if zh { "默认字体" } else { "Default font" },
+        (_, "status.fonts_loaded") => if zh { "已从 fonts 目录加载 {} 个字体" } else { "Loaded {} font(s) from the fonts folder" },
+        (_, "status.fonts_failed") => if zh { "{} 个字体文件无法识别" } else { "{} font file(s) could not be recognized" },
         (_, "tab.new") => if zh { "新建标签页" } else { "New Tab" },
         (_, "tab.close") => if zh { "关闭" } else { "Close" },
         (_, "tab.untitled") => if zh { "无标题" } else { "Untitled" },
@@ -276,12 +283,60 @@ fn create_desktop_shortcut() -> bool {
 }
 
 
-const FONT_CHOICES: &[(&str, &str)] = &[
-    ("默认字体", ""),
+/// 内置字体候选（显示名, 字体文件）。字体下拉以此为基底，
+/// 启动时再追加 exe 旁 `fonts/` 目录识别出的用户字体（见 fonts.rs）。
+const BUILTIN_FONT_CHOICES: &[(&str, &str)] = &[
     ("Consolas", "C:\\Windows\\Fonts\\consola.ttf"),
     ("黑体", "C:\\Windows\\Fonts\\simhei.ttf"),
     ("等线", "C:\\Windows\\Fonts\\Deng.ttf"),
 ];
+
+/// 字体下拉的一项。`path` 为空表示 egui 默认等宽字体；
+/// `index` 为 TTC 文件内的字体面序号（普通 ttf/otf 恒为 0）。
+struct FontChoice {
+    name: String,
+    path: String,
+    index: u32,
+}
+
+/// 构建字体下拉候选：默认字体 + 内置列表 + `fonts/` 目录用户字体。
+/// 返回 (候选列表, 成功加载的用户字体数, 无法识别的文件数)。
+fn build_font_choices() -> (Vec<FontChoice>, usize, usize) {
+    let mut choices = vec![FontChoice {
+        name: "默认字体".into(),
+        path: String::new(),
+        index: 0,
+    }];
+    for (name, file) in BUILTIN_FONT_CHOICES {
+        choices.push(FontChoice {
+            name: (*name).into(),
+            path: (*file).into(),
+            index: 0,
+        });
+    }
+    let fonts_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("fonts")));
+    let mut loaded = 0;
+    let mut failed = 0;
+    if let Some(dir) = fonts_dir {
+        let (user_fonts, failed_n): (Vec<UserFont>, usize) = fonts::scan_fonts_dir(&dir);
+        failed = failed_n;
+        for uf in user_fonts {
+            // 同名去重（内置优先）；用户字体排在内置之后
+            if choices.iter().any(|c| c.name == uf.family) {
+                continue;
+            }
+            choices.push(FontChoice {
+                name: uf.family,
+                path: uf.path.display().to_string(),
+                index: uf.index,
+            });
+            loaded += 1;
+        }
+    }
+    (choices, loaded, failed)
+}
 
 struct SearchUi {
     input: String,
@@ -593,6 +648,8 @@ struct App {
     focus_path: bool,
     font_size: f32,
     font_name: String,
+    /// 字体下拉候选（默认 + 内置 + fonts/ 目录用户字体）
+    font_choices: Vec<FontChoice>,
     wrap: bool,
     show_find: bool,
     show_replace: bool,
@@ -617,6 +674,7 @@ impl App {
             ThemeMode::Light => egui::Visuals::light(),
             ThemeMode::Dark => egui::Visuals::dark(),
         });
+        let (font_choices, fonts_loaded, fonts_failed) = build_font_choices();
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -628,6 +686,7 @@ impl App {
             focus_path: false,
             font_size: 15.0,
             font_name: "默认字体".into(),
+            font_choices,
             wrap: false,
             show_find: false,
             show_replace: false,
@@ -645,6 +704,21 @@ impl App {
         if let Some(p) = std::env::args().nth(1) {
             app.path_input = p.clone();
             app.request_open(PathBuf::from(p));
+        }
+        // fonts/ 目录扫描结果提示
+        if fonts_loaded > 0 || fonts_failed > 0 {
+            let zh = lang.is_zh();
+            let mut msg = String::new();
+            if fonts_loaded > 0 {
+                msg.push_str(&trf(lang, "status.fonts_loaded", &[&fonts_loaded.to_string()]));
+            }
+            if fonts_failed > 0 {
+                if !msg.is_empty() {
+                    msg.push_str(if zh { "，" } else { ", " });
+                }
+                msg.push_str(&trf(lang, "status.fonts_failed", &[&fonts_failed.to_string()]));
+            }
+            app.status = msg;
         }
         app
     }
@@ -1275,7 +1349,8 @@ fn install_cjk_font(ctx: &egui::Context) {
 }
 
 /// 应用编辑字体选择：重建字体定义（保留 CJK 回退）。
-fn apply_editor_font(ctx: &egui::Context, file: &str) {
+/// `index` 为 TTC 文件内的字体面序号（普通 ttf/otf 传 0）。
+fn apply_editor_font(ctx: &egui::Context, file: &str, index: u32) {
     let mut fonts = egui::FontDefinitions::default();
     if let Ok(data) = std::fs::read("C:\\Windows\\Fonts\\simhei.ttf") {
         fonts
@@ -1287,9 +1362,11 @@ fn apply_editor_font(ctx: &egui::Context, file: &str) {
     }
     if !file.is_empty() {
         if let Ok(data) = std::fs::read(file) {
+            let mut fd = egui::FontData::from_owned(data);
+            fd.index = index;
             fonts.font_data.insert(
                 "editor-font".to_owned(),
-                Arc::new(egui::FontData::from_owned(data)),
+                Arc::new(fd),
             );
             fonts
                 .families
@@ -1773,14 +1850,25 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(tr(lang, "toolbar.font"));
                 let cur = self.font_name.clone();
+                // 克隆候选列表，避免闭包内同时读写 self
+                let choices: Vec<(String, String, u32)> = self
+                    .font_choices
+                    .iter()
+                    .map(|c| (c.name.clone(), c.path.clone(), c.index))
+                    .collect();
                 egui::ComboBox::from_id_salt("font_choice")
                     .selected_text(if cur == "默认字体" { tr(lang, "font.default").to_string() } else { cur.clone() })
                     .width(120.0)
                     .show_ui(ui, |ui| {
-                        for (name, file) in FONT_CHOICES {
-                            if ui.selectable_label(cur == *name, if *name == "默认字体" { tr(lang, "font.default").to_string() } else { (*name).to_string() }).clicked() {
-                                self.font_name = (*name).to_string();
-                                apply_editor_font(ctx, file);
+                        for (name, path, index) in &choices {
+                            let label = if name == "默认字体" {
+                                tr(lang, "font.default").to_string()
+                            } else {
+                                name.clone()
+                            };
+                            if ui.selectable_label(cur == *name, label).clicked() {
+                                self.font_name = name.clone();
+                                apply_editor_font(ctx, path, *index);
                             }
                         }
                     });
