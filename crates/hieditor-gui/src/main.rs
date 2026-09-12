@@ -1,3 +1,6 @@
+// release 版以窗口子系统运行（不附带控制台窗口）；debug 版保留控制台便于调试
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! hieditor-gui — HiEditor Pro 图形界面。
 //!
 //! - 自定义绘制行视图：只渲染可视区行（虚拟化），滚动条以"行"为单位映射，
@@ -146,6 +149,12 @@ struct App {
     wrap_rows: std::collections::HashMap<u64, u32>,
     /// 上次换行排版的文本区宽度（变化即缓存失效）
     last_wrap_w: f32,
+    /// 水平滚动偏移（内容像素；仅非换行模式）
+    h_scroll: f32,
+    /// 可见行中的最大文本宽度（水平滚动范围依据，逐帧更新）
+    h_extent: f32,
+    /// 上一帧光标位置（仅光标移动时做滚动跟随，避免滚轮被光标拉回）
+    last_cursor: u64,
     search: SearchUi,
     status: String,
 }
@@ -175,6 +184,9 @@ impl App {
             wrap_skip: 0,
             wrap_rows: std::collections::HashMap::new(),
             last_wrap_w: 0.0,
+            h_scroll: 0.0,
+            h_extent: 0.0,
+            last_cursor: 0,
             search: SearchUi::default(),
             status: String::new(),
         };
@@ -204,6 +216,9 @@ impl App {
         self.covered_bytes = 0;
         self.wrap_skip = 0;
         self.wrap_rows.clear();
+        self.h_scroll = 0.0;
+        self.h_extent = 0.0;
+        self.last_cursor = 0;
         std::thread::spawn(move || {
             // 阶段一：挂基座（mmap 瞬时完成），先送回首屏
             let eb = match EditableBuffer::open_head(&path, &OpenOptions::default()) {
@@ -225,7 +240,8 @@ impl App {
             let win = 16 << 20;
             let mut buf = vec![0u8; win as usize];
             let mut covered = 0u64; // 虚拟坐标
-            let mut pending: Vec<u64> = Vec::new();
+            let mut win_starts: Vec<u64> = Vec::new(); // 本窗口行起点（builder 只消费一次）
+            let mut pending_gui: Vec<u64> = Vec::new(); // 待上报 GUI 的行起点（跨窗累积）
             // 首窗仅 1MB：内容百毫秒级可见（EmEditor 同款体验），此后约每 64MB 增量上报
             let mut next_report = HEAD_SCAN;
             while covered < vlen {
@@ -241,16 +257,17 @@ impl App {
                 for rel in memchr::memchr_iter(b'\n', &buf[..n]) {
                     let start = covered + rel as u64 + 1;
                     if start < vlen {
-                        pending.push(start);
+                        win_starts.push(start);
                     }
                 }
                 covered += n as u64;
-                builder.push_line_starts(&pending);
+                builder.push_line_starts(&win_starts);
+                pending_gui.append(&mut win_starts);
                 if covered >= next_report || covered == vlen {
-                    // 未上报窗口的行起点保留在 pending 中随下次一并发出（不可丢弃，
-                    // 否则 GUI 的 load_starts 与 covered_lines 错位）
+                    // builder 与 GUI 是两个独立消费者：起点各消费恰好一次；
+                    // 未上报的累积在 pending_gui 随下次一并发出（不可丢弃，否则错位）
                     let _ = tx.send(OpenMsg::Coverage {
-                        starts: Arc::new(std::mem::take(&mut pending)),
+                        starts: Arc::new(std::mem::take(&mut pending_gui)),
                         covered_lines: builder.covered_lines(),
                         covered_bytes: covered,
                     });
@@ -407,6 +424,63 @@ impl App {
         self.scroll_to_cursor(eb);
     }
 
+    fn copy_selection_to_clipboard(&mut self, eb: &EditableBuffer) {
+        if let Some((st, en)) = self.sel_range() {
+            if let Some(text) = copy_selection_text(eb, st, en) {
+                if clipboard_set(&text) {
+                    self.status = format!("已复制 {} 字符", text.chars().count());
+                } else {
+                    self.status = "复制失败：剪贴板不可用".into();
+                }
+            }
+        }
+    }
+
+    fn cut_selection(&mut self, eb: &mut EditableBuffer) {
+        if let Some((st, en)) = self.sel_range() {
+            if let Some(text) = copy_selection_text(eb, st, en) {
+                clipboard_set(&text);
+                let _ = eb.delete(st, en - st);
+                self.cursor = st;
+                self.anchor = None;
+                self.invalidate_search();
+                self.status = format!("已剪切 {} 字符", text.chars().count());
+            }
+        }
+    }
+
+    fn paste_from_clipboard(&mut self, eb: &mut EditableBuffer) {
+        match clipboard_get() {
+            Some(text) => self.insert_text(eb, &text),
+            None => self.status = "剪贴板为空或不可用".into(),
+        }
+    }
+
+    fn delete_selection(&mut self, eb: &mut EditableBuffer) {
+        if let Some((st, en)) = self.sel_range() {
+            let _ = eb.delete(st, en - st);
+            self.cursor = st;
+            self.anchor = None;
+            self.invalidate_search();
+        }
+    }
+
+    fn transform_selection(&mut self, eb: &mut EditableBuffer, mode: CaseMode) {
+        if let Some((st, en)) = self.sel_range() {
+            if let Some(text) = copy_selection_text(eb, st, en) {
+                let transformed = match mode {
+                    CaseMode::Upper => text.to_uppercase(),
+                    CaseMode::Lower => text.to_lowercase(),
+                    CaseMode::Title => title_case(&text),
+                };
+                let _ = eb.replace(st, en - st, transformed.as_bytes());
+                self.cursor = st + transformed.len() as u64;
+                self.anchor = None;
+                self.invalidate_search();
+            }
+        }
+    }
+
     fn do_save(eb: &mut EditableBuffer) -> String {
         match eb.save() {
             Ok(()) => format!("已保存 {}（{}）", eb.path().display(), fmt_size(eb.len())),
@@ -485,6 +559,94 @@ fn safe_slice(s: &str, r: std::ops::Range<usize>) -> String {
         hi += 1;
     }
     s[lo..hi].to_string()
+}
+
+/// 双击选词：返回包含 pos 的连续非空白字符段（UTF-8 安全，遇空白结束）。
+fn word_range_at(eb: &EditableBuffer, pos: u64) -> (u64, u64) {
+    let line = eb.line_of_offset(pos);
+    let (s, e) = eb.line_bounds(line);
+    let len = ((e - s) as usize).min(MAX_LINE_BYTES);
+    let mut buf = vec![0u8; len];
+    if eb.read(s, &mut buf).is_err() {
+        return (pos, pos);
+    }
+    let mut v: &[u8] = &buf;
+    while let Some(&l) = v.last() {
+        if l == b'\n' || l == b'\r' {
+            v = &v[..v.len() - 1];
+        } else {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(v);
+    let bytes = text.as_bytes();
+    let rel = ((pos - s) as usize).min(bytes.len());
+    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c);
+    let mut a = rel;
+    while a > 0 && !is_ws(bytes[a - 1]) {
+        a -= 1;
+    }
+    let mut b2 = rel;
+    while b2 < bytes.len() && !is_ws(bytes[b2]) {
+        b2 += 1;
+    }
+    // 对齐 char 边界（多字节字符均非空白，只会退到 lead byte）
+    while a > 0 && !text.is_char_boundary(a) {
+        a -= 1;
+    }
+    while b2 < bytes.len() && !text.is_char_boundary(b2) {
+        b2 += 1;
+    }
+    (s + a as u64, s + b2 as u64)
+}
+
+#[derive(Clone, Copy)]
+pub enum CaseMode {
+    Upper,
+    Lower,
+    Title,
+}
+
+/// 首字母大写其余小写（按空白分词）
+fn title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            out.push(c);
+            at_word_start = true;
+        } else if at_word_start {
+            out.extend(c.to_uppercase());
+            at_word_start = false;
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+fn clipboard_get() -> Option<String> {
+    arboard::Clipboard::new()
+        .ok()?
+        .get_text()
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn clipboard_set(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut c| c.set_text(text.to_owned()).ok())
+        .is_some()
+}
+
+fn copy_selection_text(eb: &EditableBuffer, st: u64, en: u64) -> Option<String> {
+    let len = (en - st) as usize;
+    let mut buf = vec![0u8; len];
+    if eb.read(st, &mut buf).is_err() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// 行界来源：索引就绪走索引；否则走已扫描前缀（load_starts）。
@@ -614,27 +776,39 @@ fn cursor_at_pointer_flat(
     pos: egui::Pos2,
     rect: egui::Rect,
     text_left: f32,
-    char_w: f32,
+    font: &egui::FontId,
+    ui: &egui::Ui,
     line_height: f32,
+    h_scroll: f32,
 ) -> u64 {
+    // 与渲染共用同一排版引擎做命中测试：消除"字符数×单字符宽度"估算
+    // 在中英文混排/字间距下的累积误差
     let row = (((pos.y - rect.top()) / line_height).floor().max(0.0)) as u64;
     let line = (first_line + row).min(n.saturating_sub(1));
-    let col_chars = (((pos.x - text_left) / char_w).max(0.0)) as u64;
     let (s, e) = line_bounds_at(index_ready, eb, load_starts, covered_lines, covered_bytes, line);
-    let read_len = ((e - s) as usize).min(MAX_LINE_BYTES);
-    let mut buf = vec![0u8; read_len];
-    let _ = eb.read(s, &mut buf);
-    let text = String::from_utf8_lossy(&buf);
-    let mut byte_col = 0u64;
-    let mut left = col_chars;
-    for c in text.chars() {
-        if left == 0 {
+    let len = ((e - s) as usize).min(MAX_LINE_BYTES);
+    let mut buf = vec![0u8; len];
+    if eb.read(s, &mut buf).is_err() {
+        return s;
+    }
+    let mut v: &[u8] = &buf;
+    while let Some(&l) = v.last() {
+        if l == b'\n' || l == b'\r' {
+            v = &v[..v.len() - 1];
+        } else {
             break;
         }
-        byte_col += c.len_utf8() as u64;
-        left -= 1;
     }
-    s + byte_col.min(e - s)
+    let text = String::from_utf8_lossy(v).into_owned();
+    if text.is_empty() {
+        return s;
+    }
+    let galley = ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), FG));
+    let sp = egui::vec2(pos.x - text_left + h_scroll, line_height * 0.5);
+    let cur = galley.cursor_from_pos(sp);
+    let char_idx = cur.index.min(text.chars().count());
+    let byte: usize = text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+    s + byte as u64
 }
 
 /// 换行模式的点击命中：视觉行 → (逻辑行, 行内视觉行)，再经整行 galley 命中测试取字符。
@@ -737,6 +911,67 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        // 轮询后台搜索（任务完成后收割结果，按偏移排序供高亮与跳转）
+        if let Some(job) = &self.search.job {
+            if job.is_done() {
+                if let Some(err) = job.error() {
+                    self.status = format!("搜索失败: {err}");
+                } else {
+                    let mut hits = job.hits_snapshot();
+                    hits.sort_by_key(|h| h.offset);
+                    let n_hits = hits.len();
+                    let elapsed = job.elapsed();
+                    self.search.hits = Arc::new(hits);
+                    self.search.selected = 0;
+                    self.status = format!(
+                        "搜索完成: 命中 {} 条，耗时 {:.0} ms（点 ▲▼ 在命中间跳转）",
+                        n_hits,
+                        elapsed.as_secs_f64() * 1e3
+                    );
+                }
+                self.search.job = None;
+            } else {
+                let (p, total) = job.progress();
+                self.status = format!("搜索中… {p}/{total} 块，已命中 {}", job.hit_count());
+                ctx.request_repaint_after(Duration::from_millis(60));
+            }
+        }
+
+        // 拖放文件到窗口 → 直接打开（悬停时显示提示遮罩）
+        let hovered = ctx.input(|i| i.raw.hovered_files.clone());
+        if !hovered.is_empty() {
+            let screen = ctx.screen_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            painter.rect_filled(
+                screen,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(80, 140, 220, 36),
+            );
+            painter.rect_stroke(
+                screen.shrink(6.0),
+                6.0,
+                egui::Stroke::new(3.0_f32, egui::Color32::from_rgb(90, 150, 230)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                "松开以打开文件",
+                egui::FontId::proportional(30.0),
+                egui::Color32::from_rgb(235, 242, 255),
+            );
+        }
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(file) = dropped.iter().find_map(|f| f.path.clone()) {
+            if file.is_file() {
+                self.path_input = file.display().to_string();
+                self.request_open(file);
+            }
+        }
+
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -791,6 +1026,7 @@ impl eframe::App for App {
                 if ui.checkbox(&mut self.wrap, "自动换行").changed() {
                     self.wrap_skip = 0;
                     self.wrap_rows.clear();
+                    self.h_scroll = 0.0;
                 }
                 let total = self.search.hits.len();
                 if !self.search.hits.is_empty() {
@@ -889,6 +1125,9 @@ impl App {
         self.last_visible = visible;
         self.first_line = self.first_line.min(n.saturating_sub(1));
         let wrap = self.wrap;
+        if wrap {
+            self.h_scroll = 0.0; // 换行模式无横向滚动
+        }
 
         // ---- 布局与度量 ----
         let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
@@ -906,21 +1145,24 @@ impl App {
         const TRACK: f32 = 14.0;
         let text_w = (rect.right() - text_left - TRACK - 6.0).max(50.0);
         let text_top_pad = (line_height - self.font_size) * 0.42;
-        let char_w = ui
-            .fonts(|f| f.layout_no_wrap("M".to_string(), font.clone(), FG))
-            .rect
-            .width()
-            .max(1.0);
 
-        // 文本区宽度变化（窗口缩放）→ 换行行数缓存失效
+        // 文本区宽度变化（窗口缩放）→ 换行行数缓存失效；水平滚动范围收敛
         if (self.last_wrap_w - text_w).abs() > 0.5 {
             self.last_wrap_w = text_w;
             self.wrap_rows.clear();
         }
+        self.h_scroll = self
+            .h_scroll
+            .clamp(0.0, (self.h_extent - text_w).max(0.0));
 
-        // ---- 滚轮（向下滚动 = 查看更后面的内容；换行模式按视觉行滚动）----
+        // ---- 滚轮（向下滚 = 后面的内容；Shift+滚轮或横向滚 = 水平平移）----
         let scroll_y = ui.input(|i| i.raw_scroll_delta.y);
-        if scroll_y != 0.0 {
+        let scroll_x = ui.input(|i| i.raw_scroll_delta.x);
+        let shift_held = ui.input(|i| i.modifiers.shift);
+        let h_delta = -scroll_x - if shift_held { scroll_y } else { 0.0 };
+        if !wrap && h_delta != 0.0 {
+            self.h_scroll = (self.h_scroll + h_delta).clamp(0.0, (self.h_extent - text_w).max(0.0));
+        } else if scroll_y != 0.0 {
             let dv = (-scroll_y / line_height).trunc() as i64;
             if dv != 0 {
                 if wrap {
@@ -957,10 +1199,10 @@ impl App {
             }
         }
 
-        // ---- 滚动条几何（两种模式都有；换行模式以逻辑行近似映射）----
-        let track = egui::Rect::from_min_size(
+        // ---- 滚动条几何（垂直 + 水平；换行模式水平条隐藏）----
+        let vtrack = egui::Rect::from_min_size(
             egui::Pos2::new(rect.right() - TRACK, rect.top()),
-            egui::Vec2::new(TRACK - 2.0, rect.height()),
+            egui::Vec2::new(TRACK - 2.0, rect.height() - TRACK),
         );
         let max_units = if wrap {
             n.max(1)
@@ -968,29 +1210,53 @@ impl App {
             n.saturating_sub(visible).max(1)
         };
         let size_frac = ((visible as f32) / (n.max(1) as f32)).min(1.0);
-        let thumb_h = (size_frac * track.height()).clamp(24.0, track.height());
+        let thumb_h = (size_frac * vtrack.height()).clamp(24.0, vtrack.height());
         let pos_frac = ((self.first_line as f32) / (max_units as f32)).min(1.0);
-        let thumb_y = track.top() + pos_frac * (track.height() - thumb_h).max(1.0);
+        let thumb_y = vtrack.top() + pos_frac * (vtrack.height() - thumb_h).max(1.0);
 
-        // ---- 鼠标：滚动条点击/拖拽跳转；内容区点击定位光标、拖拽选区 ----
+        let h_max = (self.h_extent - text_w).max(0.0);
+        let htrack = egui::Rect::from_min_size(
+            egui::Pos2::new(text_left, rect.bottom() - TRACK),
+            egui::Vec2::new(rect.right() - text_left - TRACK, TRACK - 2.0),
+        );
+        let h_thumb_w = if h_max > 0.0 {
+            (text_w / self.h_extent * htrack.width()).clamp(24.0, htrack.width())
+        } else {
+            htrack.width()
+        };
+        let h_thumb_x = htrack.left()
+            + if h_max > 0.0 {
+                (self.h_scroll / h_max) * (htrack.width() - h_thumb_w)
+            } else {
+                0.0
+            };
+
+        // ---- 鼠标：滚动条点击/拖拽；内容区点击定位光标、拖拽选区 ----
         let pointer_pos = response.interact_pointer_pos();
-        let in_track = pointer_pos.map(|p| p.x >= track.left()).unwrap_or(false);
+        let in_htrack = pointer_pos
+            .map(|p| htrack.top() <= p.y && p.x >= text_left && !wrap)
+            .unwrap_or(false);
+        let in_vtrack = pointer_pos.map(|p| p.x >= vtrack.left()).unwrap_or(false);
         if index_ready {
-            if in_track {
+            if in_htrack {
                 if response.clicked() || response.dragged() {
                     let p = pointer_pos.unwrap();
-                    let ratio = ((p.y - track.top()) - thumb_h / 2.0).max(0.0)
-                        / (track.height() - thumb_h).max(1.0);
+                    let denom = (htrack.width() - h_thumb_w).max(1.0);
+                    let ratio = ((p.x - htrack.left()) - h_thumb_w / 2.0).max(0.0) / denom;
+                    self.h_scroll = (ratio.clamp(0.0, 1.0) * h_max).min(h_max);
+                }
+            } else if in_vtrack {
+                if response.clicked() || response.dragged() {
+                    let p = pointer_pos.unwrap();
+                    let ratio = ((p.y - vtrack.top()) - thumb_h / 2.0).max(0.0)
+                        / (vtrack.height() - thumb_h).max(1.0);
                     self.first_line = ((ratio.clamp(0.0, 1.0) * max_units as f32) as u64)
                         .min(n.saturating_sub(1));
                     self.wrap_skip = 0;
                 }
             } else {
-                if response.clicked() {
-                    self.editor_focused = true;
-                    let extend = ui.input(|i| i.modifiers.shift);
-                    let pos = pointer_pos.unwrap_or(rect.min);
-                    let target = if wrap {
+                let mut target_at = |pos: egui::Pos2| -> u64 {
+                    if wrap {
                         cursor_at_pointer_wrap(
                             &mut self.wrap_rows, ui, &font, text_w, eb, index_ready,
                             self.load_starts.as_slice(), self.covered_lines, self.covered_bytes,
@@ -999,10 +1265,15 @@ impl App {
                     } else {
                         cursor_at_pointer_flat(
                             self.first_line, n, index_ready, eb, self.load_starts.as_slice(),
-                            self.covered_lines, self.covered_bytes, pos, rect, text_left, char_w,
-                            line_height,
+                            self.covered_lines, self.covered_bytes, pos, rect, text_left,
+                            &font, ui, line_height, self.h_scroll,
                         )
-                    };
+                    }
+                };
+                if response.clicked() {
+                    self.editor_focused = true;
+                    let extend = ui.input(|i| i.modifiers.shift);
+                    let target = target_at(pointer_pos.unwrap_or(rect.min));
                     if extend {
                         if self.anchor.is_none() {
                             self.anchor = Some(self.cursor);
@@ -1015,45 +1286,98 @@ impl App {
                 }
                 if response.drag_started() {
                     self.editor_focused = true;
-                    let pos = pointer_pos.unwrap_or(rect.min);
-                    let target = if wrap {
-                        cursor_at_pointer_wrap(
-                            &mut self.wrap_rows, ui, &font, text_w, eb, index_ready,
-                            self.load_starts.as_slice(), self.covered_lines, self.covered_bytes,
-                            n, self.first_line, self.wrap_skip, pos, rect, text_left, line_height,
-                        )
-                    } else {
-                        cursor_at_pointer_flat(
-                            self.first_line, n, index_ready, eb, self.load_starts.as_slice(),
-                            self.covered_lines, self.covered_bytes, pos, rect, text_left, char_w,
-                            line_height,
-                        )
-                    };
+                    let target = target_at(pointer_pos.unwrap_or(rect.min));
                     self.anchor = Some(target);
                     self.cursor = target;
                 }
                 if response.dragged() {
                     if let Some(pos) = pointer_pos {
-                        let target = if wrap {
-                            cursor_at_pointer_wrap(
-                                &mut self.wrap_rows, ui, &font, text_w, eb, index_ready,
-                                self.load_starts.as_slice(), self.covered_lines, self.covered_bytes,
-                                n, self.first_line, self.wrap_skip, pos, rect, text_left, line_height,
-                            )
-                        } else {
-                            cursor_at_pointer_flat(
-                                self.first_line, n, index_ready, eb, self.load_starts.as_slice(),
-                                self.covered_lines, self.covered_bytes, pos, rect, text_left, char_w,
-                                line_height,
-                            )
-                        };
-                        self.cursor = target;
+                        self.cursor = target_at(pos);
+                    }
+                }
+                // 双击：选中包含点击位置的连续非空白段（英文单词/汉字词，遇空格结束）
+                if response.double_clicked() {
+                    self.editor_focused = true;
+                    let pos_byte = target_at(pointer_pos.unwrap_or(rect.min));
+                    let (ws, we) = word_range_at(eb, pos_byte);
+                    if ws < we {
+                        self.anchor = Some(ws);
+                        self.cursor = we;
                     }
                 }
             }
         }
-        if response.clicked_elsewhere() {
-            self.editor_focused = false;
+        // 编辑键盘焦点保持粘性：右键菜单/滚动条操作不夺走焦点，
+        // 仅当路径/搜索输入框获得焦点时才让出（各自的 has_focus 处理器置 false）
+        if response.secondary_clicked() && !in_vtrack && !in_htrack {
+            self.editor_focused = true; // 右键呼出菜单视为仍在编辑区工作
+        }
+
+        // ---- 右键上下文菜单 ----
+        if index_ready && !in_vtrack && !in_htrack {
+            response.context_menu(|ui| {
+                let can_undo = eb.undo_depth() > 0;
+                let can_redo = eb.redo_depth() > 0;
+                let has_sel = self.sel_range().is_some();
+                let has_clip = clipboard_get().is_some();
+                if ui
+                    .add_enabled(can_undo, egui::Button::new("撤销").shortcut_text("Ctrl+Z"))
+                    .clicked()
+                {
+                    self.do_undo(eb);
+                }
+                if ui
+                    .add_enabled(can_redo, egui::Button::new("恢复").shortcut_text("Ctrl+Y"))
+                    .clicked()
+                {
+                    self.do_redo(eb);
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(eb.len() > 0, egui::Button::new("全选").shortcut_text("Ctrl+A"))
+                    .clicked()
+                {
+                    self.anchor = Some(0);
+                    self.cursor = eb.len();
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("剪切").shortcut_text("Ctrl+X"))
+                    .clicked()
+                {
+                    self.cut_selection(eb);
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("复制").shortcut_text("Ctrl+C"))
+                    .clicked()
+                {
+                    self.copy_selection_to_clipboard(eb);
+                }
+                if ui
+                    .add_enabled(has_clip, egui::Button::new("粘贴").shortcut_text("Ctrl+V"))
+                    .clicked()
+                {
+                    self.paste_from_clipboard(eb);
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("删除").shortcut_text("Del"))
+                    .clicked()
+                {
+                    self.delete_selection(eb);
+                }
+                ui.separator();
+                if ui.add_enabled(has_sel, egui::Button::new("转大写")).clicked() {
+                    self.transform_selection(eb, CaseMode::Upper);
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("转小写")).clicked() {
+                    self.transform_selection(eb, CaseMode::Lower);
+                }
+                if ui
+                    .add_enabled(has_sel, egui::Button::new("首字母大写其余小写"))
+                    .clicked()
+                {
+                    self.transform_selection(eb, CaseMode::Title);
+                }
+            });
         }
 
         // ---- 键盘（编辑区持有焦点且索引就绪时）----
@@ -1064,6 +1388,20 @@ impl App {
                     egui::Event::Text(t) => {
                         if !t.is_empty() {
                             self.insert_text(eb, &t);
+                        }
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                        // 输入法上屏（中文/日文/韩文等）
+                        if !text.is_empty() {
+                            self.insert_text(eb, &text);
+                        }
+                    }
+                    // Ctrl+C/X/V 被 egui-winit 转换为以下事件（原始 Key 已被吞掉）
+                    egui::Event::Copy => self.copy_selection_to_clipboard(eb),
+                    egui::Event::Cut => self.cut_selection(eb),
+                    egui::Event::Paste(text) => {
+                        if !text.is_empty() {
+                            self.insert_text(eb, &text);
                         }
                     }
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
@@ -1101,6 +1439,10 @@ impl App {
                             egui::Key::S if modifiers.ctrl => {
                                 self.status = Self::do_save(eb);
                             }
+                            egui::Key::A if modifiers.ctrl => {
+                                self.anchor = Some(0);
+                                self.cursor = eb.len();
+                            }
                             _ => {}
                         }
                     }
@@ -1109,9 +1451,38 @@ impl App {
             }
         }
 
-        // ---- 光标可见性（键盘/鼠标移动后；换行模式按视觉行判断）----
-        if index_ready {
+        // ---- 定位工具（光标/选区/命中 → 视觉坐标；换行模式多行，非换行单行）----
+        let prefix_w = |text: &str, byte: usize| -> f32 {
+            let seg = safe_slice(text, 0..byte);
+            ui.fonts(|f| f.layout_no_wrap(seg, font.clone(), FG)).rect.width()
+        };
+        let pos_in_line = |text: &str, byte: usize| -> (u32, f32) {
+            if !wrap {
+                return (0, prefix_w(text, byte));
+            }
+            let prefix = safe_slice(text, 0..byte);
+            let g = ui.fonts(|f| f.layout(prefix, font.clone(), FG, text_w));
+            let r = g.rows.len().saturating_sub(1);
+            let x = g.rows.get(r).map(|row| row.rect().right()).unwrap_or(0.0);
+            (r as u32, x)
+        };
+        let span_rows = |text: &str, a: usize, b: usize| -> Vec<(u32, f32, f32)> {
+            let (ra, xa) = pos_in_line(text, a);
+            let (rb, xb) = pos_in_line(text, b);
+            let mut out = Vec::new();
+            for r in ra..=rb {
+                let from = if r == ra { xa } else { 0.0 };
+                let to = if r == rb { xb } else { text_w };
+                out.push((r, from, to));
+            }
+            out
+        };
+
+        // ---- 光标滚动跟随：仅在光标移动过时触发（滚轮浏览不再被拉回）----
+        let cursor_moved = self.cursor != self.last_cursor;
+        if index_ready && cursor_moved {
             let cursor_line = eb.line_of_offset(self.cursor);
+            // 垂直
             if wrap {
                 if cursor_line < self.first_line {
                     self.first_line = cursor_line;
@@ -1142,7 +1513,34 @@ impl App {
             } else if cursor_line < self.first_line || cursor_line >= self.first_line + visible {
                 self.first_line = cursor_line.saturating_sub(visible / 4);
             }
+            // 水平（非换行模式）：光标超出视口时平移
+            if !wrap {
+                let (cs, ce) = line_bounds_at(
+                    index_ready, eb, self.load_starts.as_slice(),
+                    self.covered_lines, self.covered_bytes, cursor_line,
+                );
+                let len = ((ce - cs) as usize).min(MAX_LINE_BYTES);
+                let mut buf = vec![0u8; len];
+                let _ = eb.read(cs, &mut buf);
+                let mut v: &[u8] = &buf;
+                while let Some(&l) = v.last() {
+                    if l == b'\n' || l == b'\r' {
+                        v = &v[..v.len() - 1];
+                    } else {
+                        break;
+                    }
+                }
+                let line_text = String::from_utf8_lossy(v).into_owned();
+                let rel = ((self.cursor - cs) as usize).min(line_text.len());
+                let (_, cx) = pos_in_line(&line_text, rel);
+                if cx < self.h_scroll {
+                    self.h_scroll = (cx - text_w * 0.1).max(0.0);
+                } else if cx - self.h_scroll > text_w - 40.0 {
+                    self.h_scroll = (cx - text_w * 0.9).clamp(0.0, (self.h_extent - text_w).max(0.0));
+                }
+            }
         }
+        self.last_cursor = self.cursor;
 
         // ---- 绘制可视内容 ----
         let sel = self.sel_range();
@@ -1155,32 +1553,7 @@ impl App {
         let load_starts = self.load_starts.as_slice();
         let covered_lines = self.covered_lines;
         let covered_bytes = self.covered_bytes;
-
-        // 字节偏移 → 行内定位（视觉行号, x）；非换行模式视觉行号恒 0
-        let pos_in_line = |text: &str, byte: usize| -> (u32, f32) {
-            if !wrap {
-                let seg = safe_slice(text, 0..byte);
-                let w = ui.fonts(|f| f.layout_no_wrap(seg, font.clone(), FG)).rect.width();
-                return (0, w);
-            }
-            let prefix = safe_slice(text, 0..byte);
-            let g = ui.fonts(|f| f.layout(prefix, font.clone(), FG, text_w));
-            let r = g.rows.len().saturating_sub(1);
-            let x = g.rows.get(r).map(|row| row.rect().right()).unwrap_or(0.0);
-            (r as u32, x)
-        };
-        // 连续字节区间 [a,b) → 各视觉行的 (行号, x_from, x_to)
-        let span_rows = |text: &str, a: usize, b: usize| -> Vec<(u32, f32, f32)> {
-            let (ra, xa) = pos_in_line(text, a);
-            let (rb, xb) = pos_in_line(text, b);
-            let mut out = Vec::new();
-            for r in ra..=rb {
-                let from = if r == ra { xa } else { 0.0 };
-                let to = if r == rb { xb } else { text_w };
-                out.push((r, from, to));
-            }
-            out
-        };
+        let h_scroll = self.h_scroll;
 
         let mut y = if wrap {
             rect.top() - self.wrap_skip as f32 * line_height
@@ -1188,9 +1561,10 @@ impl App {
             rect.top()
         };
         let mut line = self.first_line;
+        let mut max_w_seen = text_w;
         loop {
             let done = if wrap {
-                y >= rect.bottom() || line >= n
+                y >= rect.bottom() - TRACK || line >= n
             } else {
                 line >= n || line >= self.first_line + visible
             };
@@ -1202,15 +1576,28 @@ impl App {
                 read_line_text(eb, index_ready, load_starts, covered_lines, covered_bytes, line);
             let text_bytes = text.len();
 
-            // 行号（右对齐，窄边距）
-            let num = ui.fonts(|f| f.layout_no_wrap(format!("{line}"), font.clone(), GUTTER_FG));
+            // 行号（右对齐，窄边距；固定不随水平滚动；1 起始显示）
+            let num =
+                ui.fonts(|f| f.layout_no_wrap(format!("{}", line + 1), font.clone(), GUTTER_FG));
             painter.galley(
                 egui::Pos2::new(text_left - 8.0 - num.rect.width(), y + text_top_pad),
                 num,
                 GUTTER_FG,
             );
 
-            // 选区底色（先于文本绘制；换行模式跨视觉行）
+            // 整行文本 galley（换行模式按 text_w 折行）
+            let galley = if wrap {
+                ui.fonts(|f| f.layout(text.clone(), font.clone(), FG, text_w))
+            } else {
+                ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), FG))
+            };
+            let rows_used = galley.rows.len().max(1) as u32;
+            let galley_w = galley.rect.width();
+
+            // 内容水平偏移：屏幕x = text_left + 内容x - h_scroll
+            let ox = |x: f32| -> f32 { text_left + x - h_scroll };
+
+            // 选区底色
             if let Some((ss, se)) = sel {
                 let s_end = s + text_bytes as u64;
                 let a = ss.max(s).min(s_end);
@@ -1219,7 +1606,7 @@ impl App {
                     for (r, xf, xt) in span_rows(&text, (a - s) as usize, (b - s) as usize) {
                         painter.rect_filled(
                             egui::Rect::from_min_size(
-                                egui::Pos2::new(text_left + xf, y + r as f32 * line_height),
+                                egui::Pos2::new(ox(xf), y + r as f32 * line_height),
                                 egui::Vec2::new((xt - xf).max(2.0), line_height),
                             ),
                             0.0,
@@ -1242,7 +1629,7 @@ impl App {
                 for (r, xf, xt) in span_rows(&text, (h.offset - s) as usize, (b - s) as usize) {
                     painter.rect_filled(
                         egui::Rect::from_min_size(
-                            egui::Pos2::new(text_left + xf, y + r as f32 * line_height),
+                            egui::Pos2::new(ox(xf), y + r as f32 * line_height),
                             egui::Vec2::new((xt - xf).max(2.0), line_height),
                         ),
                         2.0,
@@ -1255,14 +1642,11 @@ impl App {
                 }
             }
 
-            // 整行文本（换行模式按 text_w 折行）
-            let galley = if wrap {
-                ui.fonts(|f| f.layout(text.clone(), font.clone(), FG, text_w))
-            } else {
-                ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), FG))
-            };
-            let rows_used = galley.rows.len().max(1) as u32;
-            painter.galley(egui::Pos2::new(text_left, y + text_top_pad), galley, FG);
+            // 文本
+            painter.galley(egui::Pos2::new(ox(0.0), y + text_top_pad), galley, FG);
+            if !wrap {
+                max_w_seen = max_w_seen.max(galley_w);
+            }
 
             // 截断标记
             if (e_raw - s) as usize > text_bytes + 2 {
@@ -1276,7 +1660,7 @@ impl App {
                 });
                 painter.galley(
                     egui::Pos2::new(
-                        text_left + tx + 4.0,
+                        ox(tx) + 4.0,
                         y + tr as f32 * line_height + text_top_pad,
                     ),
                     g,
@@ -1288,27 +1672,45 @@ impl App {
             if cursor_line_visible && cursor_line == line {
                 let rel = ((cursor - s) as usize).min(text_bytes);
                 let (r, x) = pos_in_line(&text, rel);
-                painter.rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::Pos2::new(text_left + x, y + r as f32 * line_height),
-                        egui::Vec2::new(2.0, line_height),
-                    ),
-                    0.0,
-                    CURSOR_COLOR,
+                let cursor_rect = egui::Rect::from_min_size(
+                    egui::Pos2::new(ox(x), y + r as f32 * line_height),
+                    egui::Vec2::new(2.0, line_height),
                 );
+                painter.rect_filled(cursor_rect, 0.0, CURSOR_COLOR);
+                // 上报 IME 锚点：egui-winit 据此 set_ime_allowed(true) 并定位候选窗
+                ui.ctx().output_mut(|o| {
+                    o.ime = Some(egui::output::IMEOutput {
+                        rect: cursor_rect.expand(2.0),
+                        cursor_rect,
+                    });
+                });
             }
 
             y += rows_used as f32 * line_height;
             line += 1;
         }
+        self.h_extent = max_w_seen;
 
-        // ---- 滚动条 ----
-        painter.rect_filled(track, 2.0, egui::Color32::from_rgb(40, 40, 46));
+        // ---- 垂直滚动条 ----
+        painter.rect_filled(vtrack, 2.0, egui::Color32::from_rgb(40, 40, 46));
         if size_frac < 1.0 {
             painter.rect_filled(
                 egui::Rect::from_min_size(
-                    egui::Pos2::new(track.left() + 1.0, thumb_y),
-                    egui::Vec2::new(track.width() - 2.0, thumb_h),
+                    egui::Pos2::new(vtrack.left() + 1.0, thumb_y),
+                    egui::Vec2::new(vtrack.width() - 2.0, thumb_h),
+                ),
+                3.0,
+                egui::Color32::from_rgb(110, 110, 130),
+            );
+        }
+
+        // ---- 水平滚动条（非换行且内容超宽时出现）----
+        if !wrap && h_max > 0.0 {
+            painter.rect_filled(htrack, 2.0, egui::Color32::from_rgb(40, 40, 46));
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::Pos2::new(h_thumb_x + 1.0, htrack.top()),
+                    egui::Vec2::new(h_thumb_w - 2.0, htrack.height()),
                 ),
                 3.0,
                 egui::Color32::from_rgb(110, 110, 130),

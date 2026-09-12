@@ -664,7 +664,7 @@ mod builder_tests {
 
     #[test]
     fn builder_empty_and_trailing_newline() {
-        let mut b = LineIndexBuilder::new(0);
+        let b = LineIndexBuilder::new(0);
         let idx = b.finish(0);
         assert_eq!(idx.line_count(), 1);
 

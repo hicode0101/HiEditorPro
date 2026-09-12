@@ -12,4 +12,5 @@ path = "src/main.rs"
 hieditor-core = { path = "../hieditor-core" }
 hieditor-search = { path = "../hieditor-search" }
 memchr = "2.7"
+arboard = "3"
 eframe = { workspace = true }

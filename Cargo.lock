@@ -1570,6 +1570,7 @@ dependencies = [
 name = "hieditor-gui"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "eframe",
  "hieditor-core",
  "hieditor-search",
