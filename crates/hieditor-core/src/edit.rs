@@ -466,6 +466,10 @@ impl EditableBuffer {
     }
 
     /// 全部替换（顺序左到右、不重叠）。整批一个撤销单元。返回替换次数。
+    ///
+    /// 一次走查构建新 piece 序列（O(pieces + 命中数)）。
+    /// 不逐个 splice：piece_insert/remove 每次都重建 cum（O(piece 总数)），
+    /// 大量命中时整体退化为 O(n²) 导致界面假死。
     pub fn replace_all(
         &mut self,
         needle: &[u8],
@@ -477,12 +481,74 @@ impl EditableBuffer {
             return 0;
         }
         let before = (self.pieces.clone(), self.cum.clone(), self.vlen);
-        for &(pos, hlen) in hits.iter().rev() {
-            self.piece_remove(pos, hlen);
-            let off = self.add_buf.len() as u64;
+
+        // 替换文本一次性追加进 add_buf（append-only，不影响已有 piece 引用）
+        let rlen = replacement.len() as u64;
+        let mut add_offs: Vec<u64> = Vec::with_capacity(hits.len());
+        for _ in 0..hits.len() {
+            add_offs.push(self.add_buf.len() as u64);
             self.add_buf.extend_from_slice(replacement);
-            self.piece_insert(pos, off, replacement.len() as u64);
         }
+
+        // 沿旧 piece 线性推进，交替拼出 保留段 / 替换段
+        let old_pieces = std::mem::take(&mut self.pieces);
+        let mut new_pieces: Vec<Piece> = Vec::with_capacity(old_pieces.len() + hits.len() * 2);
+        let mut new_cum: Vec<u64> = Vec::with_capacity(old_pieces.len() + hits.len() * 2 + 1);
+        new_cum.push(0);
+        let mut total = 0u64;
+        let (mut pi, mut poff) = (0usize, 0u64); // 旧 piece 游标
+        let mut cursor = 0u64; // 已覆盖的虚拟偏移
+        let emit_retain = |bound: u64,
+                               old: &[Piece],
+                               pi: &mut usize,
+                               poff: &mut u64,
+                               cursor: &mut u64,
+                               out: &mut Vec<Piece>,
+                               cum: &mut Vec<u64>,
+                               total: &mut u64| {
+            while *cursor < bound {
+                let p = old[*pi];
+                let take = (p.len - *poff).min(bound - *cursor);
+                cum.push({ *total += take; *total });
+                out.push(Piece { src: Self::shift_src(p.src, *poff), len: take });
+                *poff += take;
+                *cursor += take;
+                if *poff == p.len {
+                    *pi += 1;
+                    *poff = 0;
+                }
+            }
+        };
+        for (i, &(pos, hlen)) in hits.iter().enumerate() {
+            emit_retain(
+                pos, &old_pieces, &mut pi, &mut poff, &mut cursor,
+                &mut new_pieces, &mut new_cum, &mut total,
+            );
+            // 游标跳过被替换的源字节 [pos, pos+hlen)，与新虚拟偏移保持同步
+            let mut skip = hlen;
+            while skip > 0 {
+                let p = old_pieces[pi];
+                let take = (p.len - poff).min(skip);
+                poff += take;
+                skip -= take;
+                if poff == p.len {
+                    pi += 1;
+                    poff = 0;
+                }
+            }
+            cursor = pos + hlen;
+            new_cum.push({ total += rlen; total });
+            new_pieces.push(Piece { src: Src::Add(add_offs[i]), len: rlen });
+        }
+        emit_retain(
+            self.vlen, &old_pieces, &mut pi, &mut poff, &mut cursor,
+            &mut new_pieces, &mut new_cum, &mut total,
+        );
+
+        let removed: u64 = hits.iter().map(|&(_, l)| l).sum();
+        self.pieces = new_pieces;
+        self.cum = new_cum;
+        self.vlen = before.2 - removed + hits.len() as u64 * rlen;
         self.dirty = true;
         self.rebuild_index_full();
         let after = (self.pieces.clone(), self.cum.clone(), self.vlen);
@@ -525,9 +591,11 @@ impl EditableBuffer {
                 }
                 out.push((abs, nlen));
             }
-            w += n as u64;
-            if step_back > 0 && w >= step_back {
-                w -= step_back; // 回退重叠区，覆盖跨窗口命中
+            if n as u64 == win {
+                // 还有后续窗口：回退重叠区，覆盖跨窗口命中
+                w += n as u64 - step_back;
+            } else {
+                w = self.vlen; // 已是最后一个窗口
             }
         }
         out
@@ -882,6 +950,53 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn replace_all_matches_reference() {
+        // 相邻命中 + 替换文本长于查找词 + 整批撤销/重做
+        let mut eb = EditableBuffer::from_vec(b"abXabXXab".to_vec());
+        assert_eq!(eb.replace_all(b"ab", b"[-]", false), 3);
+        let mut out = vec![0u8; eb.len() as usize];
+        eb.read(0, &mut out).unwrap();
+        assert_eq!(out, b"[-]X[-]XX[-]");
+        assert_eq!(eb.len(), 12);
+
+        assert!(eb.undo());
+        let mut out2 = vec![0u8; eb.len() as usize];
+        eb.read(0, &mut out2).unwrap();
+        assert_eq!(out2, b"abXabXXab");
+
+        assert!(eb.redo());
+        let mut out3 = vec![0u8; eb.len() as usize];
+        eb.read(0, &mut out3).unwrap();
+        assert_eq!(out3, b"[-]X[-]XX[-]");
+    }
+
+    #[test]
+    fn replace_all_case_insensitive_and_no_hit() {
+        // "Abc" 与 "ABC" 都被大小写不敏感命中，相邻命中各自替换
+        let mut eb = EditableBuffer::from_vec(b"aAbcABC".to_vec());
+        assert_eq!(eb.replace_all(b"abc", b"Z", true), 2);
+        let mut out = vec![0u8; eb.len() as usize];
+        eb.read(0, &mut out).unwrap();
+        assert_eq!(out, b"aZZ");
+        // 无命中：内容不变，也不产生撤销命令
+        assert_eq!(eb.replace_all(b"nope", b"Z", false), 0);
+        assert_eq!(eb.undo_depth(), 1);
+    }
+
+    #[test]
+    fn replace_all_after_edits_spans_pieces() {
+        // 先插入/删除使 piece 碎片化，再全部替换（命中横跨 Base/Add 段）
+        let mut eb = EditableBuffer::from_vec(b"hello world hello".to_vec());
+        eb.insert(5, b"!").unwrap(); // hello! world hello
+        eb.delete(0, 1).unwrap(); // ello! world hello
+        assert_eq!(eb.replace_all(b"o", b"0", false), 3);
+        let mut out = vec![0u8; eb.len() as usize];
+        eb.read(0, &mut out).unwrap();
+        assert_eq!(out, b"ell0! w0rld hell0");
+        assert_eq!(eb.len(), 17);
     }
 
     #[test]

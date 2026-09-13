@@ -345,6 +345,13 @@ struct SearchUi {
     job: Option<SearchJob>,
     hits: Arc<Vec<SearchHit>>,
     selected: usize,
+    /// 当前 hits 对应的查询（输入, 区分大小写, 全词）。
+    /// 查询未变时不再重启后台搜索（避免"下一个"每点一次就全文件重扫）。
+    last_query: Option<(String, bool, bool)>,
+    /// 搜索完成后跳到第一个命中（"下一个"首次触发搜索时置位）
+    jump_pending: bool,
+    /// 搜索完成后选中第一个 >= 该偏移的命中（替换后定位下一命中用）
+    jump_to_offset: Option<u64>,
 }
 
 impl Default for SearchUi {
@@ -356,6 +363,9 @@ impl Default for SearchUi {
             job: None,
             hits: Arc::new(Vec::new()),
             selected: 0,
+            last_query: None,
+            jump_pending: false,
+            jump_to_offset: None,
         }
     }
 }
@@ -443,6 +453,9 @@ impl Tab {
         }
         self.search.hits = Arc::new(Vec::new());
         self.search.selected = 0;
+        self.search.last_query = None;
+        self.search.jump_pending = false;
+        self.search.jump_to_offset = None;
         self.wrap_rows.clear();
     }
 
@@ -655,6 +668,8 @@ struct App {
     show_replace: bool,
     show_settings: bool,
     show_about: bool,
+    /// 查找面板打开后请求聚焦查找输入框（一次）
+    focus_find: bool,
     lang: Lang,
     theme_mode: ThemeMode,
     editor_focused: bool,
@@ -692,6 +707,7 @@ impl App {
             show_replace: false,
             show_settings: false,
             show_about: false,
+            focus_find: false,
             lang,
             theme_mode,
             editor_focused: false,
@@ -863,6 +879,15 @@ impl App {
         if tab.search.input.is_empty() {
             return;
         }
+        // 幂等守卫：同一查询且搜索已完成 → 直接用现有结果，不重扫
+        let query_key = (
+            tab.search.input.clone(),
+            tab.search.case_sensitive,
+            tab.search.whole_word,
+        );
+        if tab.search.job.is_none() && tab.search.last_query.as_ref() == Some(&query_key) {
+            return;
+        }
         if let Some(job) = &tab.search.job {
             job.cancel();
         }
@@ -875,9 +900,34 @@ impl App {
             Ok(job) => {
                 tab.search.hits = Arc::new(Vec::new());
                 tab.search.selected = 0;
+                tab.search.last_query = Some(query_key);
                 tab.search.job = Some(job);
             }
             Err(e) => self.status = format!("搜索失败: {e}"),
+        }
+    }
+
+    /// "下一个/上一个"：结果已就绪直接跳；否则先启动搜索并在完成后跳到首个命中。
+    fn search_next(&mut self, delta: i64) {
+        let Some(tab) = self.active_mut() else { return };
+        if tab.search.input.is_empty() {
+            return;
+        }
+        if tab.search.job.is_some() {
+            return; // 搜索进行中，等完成后由 jump_pending 跳转
+        }
+        let query_key = (
+            tab.search.input.clone(),
+            tab.search.case_sensitive,
+            tab.search.whole_word,
+        );
+        if tab.search.last_query.as_ref() == Some(&query_key) && !tab.search.hits.is_empty() {
+            self.goto_hit(delta);
+        } else {
+            self.start_search();
+            if let Some(t) = self.active_mut() {
+                t.search.jump_pending = true;
+            }
         }
     }
 
@@ -889,8 +939,12 @@ impl App {
         }
         tab.search.selected =
             ((tab.search.selected as i64 + delta).rem_euclid(total)) as usize;
-        let line = tab.search.hits[tab.search.selected].line;
-        tab.first_line = line.saturating_sub(tab.last_visible / 4);
+        // 行号动态计算：命中表可能经过替换后的增量修正，行号字段不可信
+        let offset = tab.search.hits[tab.search.selected].offset;
+        if tab.eb.has_index() {
+            let line = tab.eb.line_of_offset(offset);
+            tab.first_line = line.saturating_sub(tab.last_visible / 4);
+        }
         tab.wrap_skip = 0;
     }
 
@@ -898,13 +952,42 @@ impl App {
         let lang = self.lang;
         let Some(repl) = non_empty(&self.replace_text_input()) else { return };
         let Some(tab) = self.active_mut() else { return };
-        let Some(h) = tab.search.hits.get(tab.search.selected).cloned() else { return };
-        let _ = tab.eb.replace(h.offset, u64::from(h.len), repl.as_bytes());
+        let sel = tab.search.selected;
+        let Some(h) = tab.search.hits.get(sel).cloned() else { return };
+        // 防御：命中处内容应与查找词一致（结果过期时放弃本次替换并重扫）
+        let needle = tab.search.input.as_bytes().to_vec();
+        let mut cur = vec![0u8; h.len as usize];
+        let matched = tab.eb.read(h.offset, &mut cur).is_ok()
+            && if tab.search.case_sensitive {
+                cur == needle
+            } else {
+                cur.eq_ignore_ascii_case(&needle)
+            };
+        if !matched {
+            tab.invalidate_search();
+            self.status = "搜索结果已过期，正在重新搜索".into();
+            self.start_search();
+            return;
+        }
+        if tab.eb.replace(h.offset, u64::from(h.len), repl.as_bytes()).is_err() {
+            return;
+        }
+        // 增量修正命中表：移除已替换项，其后命中偏移平移。
+        // 不整文件重扫——连续点"替换"时无需等待 GB 级扫描。
+        let delta = repl.len() as i64 - h.len as i64;
+        {
+            let hits = Arc::make_mut(&mut tab.search.hits);
+            hits.remove(sel);
+            for hit in hits.iter_mut().skip(sel) {
+                hit.offset = (hit.offset as i64 + delta).max(0) as u64;
+            }
+            // selected 停在原位 = 原命中的下一条，连续替换直接按"替换"即可
+            tab.search.selected = if hits.is_empty() { 0 } else { sel.min(hits.len() - 1) };
+        }
         tab.cursor = h.offset + repl.len() as u64;
         tab.anchor = None;
-        tab.invalidate_search();
+        tab.scroll_to_cursor();
         self.status = tr(lang, "status.replaced1").into();
-        self.start_search(); // 重新搜索刷新命中
     }
 
     fn replace_all_in_active(&mut self) {
@@ -1520,6 +1603,26 @@ impl eframe::App for App {
             if ti == self.active {
                 self.status = format!("{} {n}", tr(lang, "status.searchdone"));
             }
+            // 完成后跳转："下一个"的首个命中 / 替换后的下一命中定位
+            let jump_first = std::mem::take(&mut tab.search.jump_pending);
+            let jump_off = tab.search.jump_to_offset.take();
+            if jump_first || jump_off.is_some() {
+                let mut idx = 0usize;
+                if let Some(off) = jump_off {
+                    idx = tab.search.hits.partition_point(|h| h.offset < off);
+                    if idx >= tab.search.hits.len() {
+                        idx = tab.search.hits.len().saturating_sub(1);
+                    }
+                    tab.search.selected = idx;
+                }
+                if let Some(h) = tab.search.hits.get(idx) {
+                    if tab.eb.has_index() {
+                        let line = tab.eb.line_of_offset(h.offset);
+                        tab.first_line = line.saturating_sub(tab.last_visible / 4);
+                        tab.wrap_skip = 0;
+                    }
+                }
+            }
         }
         if let Some(t) = self.tabs.get(self.active) {
             if t.search.job.is_some() {
@@ -1811,11 +1914,13 @@ impl eframe::App for App {
                         if ui.button(tr(lang, "search.menufind")).clicked() {
                             self.show_find = true;
                             self.show_replace = false;
+                            self.focus_find = true;
                             ui.close();
                         }
                         if ui.button(tr(lang, "search.menufr")).clicked() {
                             self.show_find = true;
                             self.show_replace = true;
+                            self.focus_find = true;
                             ui.close();
                         }
                     });
@@ -2088,24 +2193,36 @@ impl eframe::App for App {
 
         // ---- 查找/替换面板 ----
         if self.show_find {
+            // Esc 关闭面板（焦点在输入框或编辑区均生效）
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.show_find = false;
+                self.show_replace = false;
+                self.editor_focused = true;
+            }
             egui::TopBottomPanel::top("find_bar").show(ctx, |ui| {
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     ui.label(tr(lang, "search.label"));
+                    let mut enter_find = false;
                     if let Some(t) = self.active_mut() {
-                        ui.add_sized(
+                        let find_edit = ui.add_sized(
                             [220.0, 20.0],
                             egui::TextEdit::singleline(&mut t.search.input)
                                 .hint_text(tr(lang, "search.findhint")),
                         );
+                        if self.focus_find {
+                            self.focus_find = false;
+                            find_edit.request_focus();
+                        }
+                        // 查找框内按回车 = 跳到下一个命中
+                        enter_find = find_edit.has_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     }
-                    if ui.button(tr(lang, "search.next")).clicked() {
-                        self.start_search();
-                        self.goto_hit(1);
+                    if ui.button(tr(lang, "search.next")).clicked() || enter_find {
+                        self.search_next(1);
                     }
                     if ui.button(tr(lang, "search.prev")).clicked() {
-                        self.start_search();
-                        self.goto_hit(-1);
+                        self.search_next(-1);
                     }
                     if ui.button(tr(lang, "search.all")).clicked() {
                         self.start_search();
@@ -2118,6 +2235,8 @@ impl eframe::App for App {
                         if let Some(t) = self.active_mut() {
                             t.search.case_sensitive = cs;
                         }
+                        // 选项变化 → 按新条件重新搜索
+                        self.start_search();
                     }
                     let mut ww = self
                         .active_mut()
@@ -2127,6 +2246,7 @@ impl eframe::App for App {
                         if let Some(t) = self.active_mut() {
                             t.search.whole_word = ww;
                         }
+                        self.start_search();
                     }
                     let mut re = false;
                     if ui
@@ -2145,14 +2265,18 @@ impl eframe::App for App {
                 if self.show_replace {
                     ui.horizontal(|ui| {
                         ui.label(tr(lang, "search.replace"));
+                        let mut enter_replace = false;
                         if let Some(t) = self.active_mut() {
-                            ui.add_sized(
+                            let repl_edit = ui.add_sized(
                                 [220.0, 20.0],
                                 egui::TextEdit::singleline(&mut t.replace_input)
                                     .hint_text(tr(lang, "search.replacehint")),
                             );
+                            // 替换框内按回车 = 替换当前命中
+                            enter_replace = repl_edit.has_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         }
-                        if ui.button(tr(lang, "search.replace")).clicked() {
+                        if ui.button(tr(lang, "search.replace")).clicked() || enter_replace {
                             self.replace_current();
                         }
                         if ui.button(tr(lang, "search.replaceall")).clicked() {
@@ -2480,6 +2604,10 @@ impl App {
 
         // ---- 布局与度量 ----
         let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        // 文本区悬停显示 I 形光标
+        if response.hovered() {
+            ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+        }
         let painter = ui.painter_at(rect);
         let font = egui::FontId::monospace(self.font_size);
         let digit_w = ui
@@ -2602,6 +2730,27 @@ impl App {
                     tab.wrap_skip = 0;
                 }
             } else {
+                // ---- 拖动选取：边缘自动滚动（在闭包定义前完成视图滚动） ----
+                if response.dragged() {
+                    if let Some(pos) = pointer_pos {
+                        const EDGE: f32 = 28.0;
+                        let near_top = pos.y < rect.top() + EDGE;
+                        let near_bottom = pos.y > rect.bottom() - TRACK - EDGE;
+                        if near_top || near_bottom {
+                            if wrap {
+                                step_visual(
+                                    &mut tab.wrap_rows, ui, &font, text_w, &tab.eb, index_ready,
+                                    tab.load_starts.as_slice(), tab.covered_lines, tab.covered_bytes,
+                                    n, &mut tab.first_line, &mut tab.wrap_skip, near_bottom,
+                                );
+                            } else if near_top {
+                                tab.first_line = tab.first_line.saturating_sub(1);
+                            } else {
+                                tab.first_line = (tab.first_line + 1).min(n.saturating_sub(1));
+                            }
+                        }
+                    }
+                }
                 let mut target_at = |pos: egui::Pos2| -> u64 {
                     if wrap {
                         cursor_at_pointer_wrap(
@@ -2642,6 +2791,10 @@ impl App {
                         tab.cursor = target_at(pos);
                     }
                 }
+                // 单击被误判为拖动（零位移）时，释放后不留残选区
+                if response.drag_stopped() && tab.anchor == Some(tab.cursor) {
+                    tab.anchor = None;
+                }
                 // 双击选词
                 if response.double_clicked() {
                     self.editor_focused = true;
@@ -2651,6 +2804,16 @@ impl App {
                         tab.anchor = Some(ws);
                         tab.cursor = we;
                     }
+                }
+                // 三击选整行（不含行尾换行符）
+                if response.triple_clicked() && index_ready {
+                    self.editor_focused = true;
+                    let pos_byte = target_at(pointer_pos.unwrap_or(rect.min));
+                    let line = tab.eb.line_of_offset(pos_byte);
+                    let s = tab.eb.start_of_line(line);
+                    let e = line_content_end(&tab.eb, line);
+                    tab.anchor = Some(s);
+                    tab.cursor = e;
                 }
             }
         }
@@ -2822,10 +2985,12 @@ impl App {
                             egui::Key::F if modifiers.ctrl => {
                                 self.show_find = true;
                                 self.show_replace = false;
+                                self.focus_find = true;
                             }
                             egui::Key::H if modifiers.ctrl => {
                                 self.show_find = true;
                                 self.show_replace = true;
+                                self.focus_find = true;
                             }
                             _ => {}
                         }
