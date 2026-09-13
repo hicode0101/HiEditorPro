@@ -20,3 +20,13 @@ arboard = "3"
 rfd = "0.15"
 sys-locale = "0.3"
 eframe = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_Com",
+    "Win32_System_Memory",
+] }

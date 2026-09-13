@@ -1644,6 +1644,7 @@ dependencies = [
  "memchr",
  "rfd",
  "sys-locale",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

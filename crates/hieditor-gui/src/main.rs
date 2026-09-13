@@ -32,6 +32,10 @@ use theme::{editor_theme, ui as theme_ui};
 mod fonts;
 use fonts::UserFont;
 
+// ---------- 打印 ----------
+// Win32 标准打印对话框 + GDI 分页文本打印（后台线程）
+mod printing;
+
 /// 每行渲染字节上限（超长行截断显示）
 const MAX_LINE_BYTES: usize = 80_000;
 /// GUI 搜索命中上限
@@ -190,6 +194,14 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "file.open_recent") => if zh { "打开最近所用文件" } else { "Open Recent" },
         (_, "file.save_all") => if zh { "全部保存" } else { "Save All" },
         (_, "file.print") => if zh { "打印…" } else { "Print…" },
+        (_, "print.noindex") => if zh { "行索引构建中，完成后可打印" } else { "Printing unlocks when indexing finishes" },
+        (_, "print.empty") => if zh { "当前文档为空" } else { "Document is empty" },
+        (_, "print.nosel") => if zh { "没有选中内容" } else { "Nothing selected" },
+        (_, "print.nopages") => if zh { "页码超出文档范围" } else { "Page range out of document" },
+        (_, "print.toomany") => if zh { "打印范围过大（上限 {} 页），请用页码范围缩小" } else { "Print range too large (cap {} pages); narrow the page range" },
+        (_, "print.status.printing") => if zh { "正在打印 {} 页…" } else { "Printing {} page(s)…" },
+        (_, "print.status.done") => if zh { "已发送 {} 页至 {}" } else { "Sent {} page(s) to {}" },
+        (_, "print.status.fail") => if zh { "打印失败" } else { "Print failed" },
         (_, "file.close_tab") => if zh { "关闭标签页" } else { "Close Tab" },
         (_, "file.close_window") => if zh { "关闭窗口" } else { "Close Window" },
         (_, "status.saveall_done") => if zh { "全部保存完成" } else { "All tabs saved" },
@@ -255,6 +267,23 @@ fn load_settings() -> (Lang, ThemeMode) {
         }
     }
     (lang, theme)
+}
+
+/// 应用面板主题（菜单栏/工具栏/标签栏/状态栏等 egui 控件颜色）。
+///
+/// 必须同时做两件事，否则重启后面板会退回浅色：
+/// 1. `set_theme` 固定主题偏好——egui 默认"跟随系统"，每帧 begin_pass 都会
+///    用系统主题切换激活槽位，导致写入的颜色被绕开；
+/// 2. 深浅两个槽位都写入同一样式——无论 egui 当前激活哪个槽位都显示正确。
+fn apply_panel_theme(ctx: &egui::Context, dark: bool) {
+    let (pref, visuals) = if dark {
+        (egui::ThemePreference::Dark, egui::Visuals::dark())
+    } else {
+        (egui::ThemePreference::Light, egui::Visuals::light())
+    };
+    ctx.set_theme(pref);
+    ctx.set_visuals_of(egui::Theme::Dark, visuals.clone());
+    ctx.set_visuals_of(egui::Theme::Light, visuals);
 }
 
 fn save_settings(lang: Lang, theme: ThemeMode) {
@@ -670,8 +699,15 @@ struct App {
     show_about: bool,
     /// 查找面板打开后请求聚焦查找输入框（一次）
     focus_find: bool,
+    /// 后台打印状态接收端（spool 线程 → 状态栏）
+    print_rx: Option<Receiver<String>>,
+    /// Ctrl+P 暂存标记（渲染期标签页已取出，update 末尾标签放回后处理）
+    print_requested: bool,
     lang: Lang,
     theme_mode: ThemeMode,
+    /// 已应用到 egui 的面板主题（None = 尚未应用；与 theme_mode 不一致时在
+    /// update 开头重新 apply_panel_theme，兜底 eframe 对样式的任何后续覆盖）
+    applied_theme: Option<ThemeMode>,
     editor_focused: bool,
     /// 上一帧各标签页矩形（id, rect），供拖拽命中测试
     tab_rects: Vec<(u64, egui::Rect)>,
@@ -685,10 +721,7 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (lang, theme_mode) = load_settings();
-        cc.egui_ctx.set_visuals(match theme_mode {
-            ThemeMode::Light => egui::Visuals::light(),
-            ThemeMode::Dark => egui::Visuals::dark(),
-        });
+        apply_panel_theme(&cc.egui_ctx, theme_mode == ThemeMode::Dark);
         let (font_choices, fonts_loaded, fonts_failed) = build_font_choices();
         let mut app = Self {
             tabs: Vec::new(),
@@ -708,8 +741,11 @@ impl App {
             show_settings: false,
             show_about: false,
             focus_find: false,
+            print_rx: None,
+            print_requested: false,
             lang,
             theme_mode,
+            applied_theme: None,
             editor_focused: false,
             tab_rects: Vec::new(),
             pointer_x: 0.0,
@@ -1017,6 +1053,150 @@ impl App {
             .get(self.active)
             .map(|t| t.replace_input.clone())
             .unwrap_or_default()
+    }
+
+    /// 打印当前标签页：系统打印对话框 → 范围解析 → 物化行文本 → 后台 spool。
+    fn start_print(&mut self) {
+        let lang = self.lang;
+        // ---- 阶段 1：读取当前标签信息（借用随块结束） ----
+        struct PrintInfo {
+            total_lines: u64,
+            cur_line: u64,
+            sel_lines: Option<(u64, u64)>,
+            doc_name: String,
+        }
+        let info = {
+            let Some(tab) = self.active_mut() else { return };
+            if !tab.eb.has_index() {
+                self.status = tr(lang, "print.noindex").into();
+                return;
+            }
+            let total_lines = tab.eb.line_count();
+            if total_lines == 0 {
+                self.status = tr(lang, "print.empty").into();
+                return;
+            }
+            let sel_lines = tab.sel_range().map(|(s, e)| {
+                let a = tab.eb.line_of_offset(s);
+                let b = tab.eb.line_of_offset(e.saturating_sub(1).max(s));
+                (a, b)
+            });
+            PrintInfo {
+                total_lines,
+                cur_line: tab.eb.line_of_offset(tab.cursor),
+                sel_lines,
+                doc_name: tab.title(),
+            }
+        };
+        let font_pt = self.font_size;
+        let font_face = match self.font_name.as_str() {
+            "Consolas" => "Consolas",
+            "黑体" => "SimHei",
+            "等线" => "DengXian",
+            _ => "Consolas",
+        }
+        .to_string();
+
+        // ---- 阶段 2：系统打印对话框（模态；取消则静默返回） ----
+        let est_lpp = printing::estimate_lines_per_page(font_pt).max(1);
+        let est_total =
+            (((info.total_lines + est_lpp - 1) / est_lpp) as u32).min(9_999_999);
+        let Some(dlg) = printing::run_print_dialog(est_total) else { return };
+
+        // ---- 阶段 3：按真实打印机参数解析范围 → 页码列表 ----
+        let lpp = printing::page_metrics(dlg.hdc, font_pt).lines_per_page.max(1);
+        let (base_line, line_count) = match &dlg.scope {
+            printing::PrintScope::Selection => match info.sel_lines {
+                Some((a, b)) if b >= a => (a, b - a + 1),
+                _ => {
+                    unsafe { printing::discard_dc(dlg.hdc) };
+                    self.status = tr(lang, "print.nosel").into();
+                    return;
+                }
+            },
+            _ => (0, info.total_lines),
+        };
+        let total_pages = ((line_count + lpp - 1) / lpp) as u32;
+        let mut pages: Vec<u32> = Vec::new();
+        match &dlg.scope {
+            printing::PrintScope::All | printing::PrintScope::Selection => {
+                pages.extend(1..=total_pages);
+            }
+            printing::PrintScope::CurrentPage => {
+                let p = (info.cur_line.saturating_sub(base_line) / lpp + 1) as u32;
+                pages.push(p.clamp(1, total_pages.max(1)));
+            }
+            printing::PrintScope::Pages(ranges) => {
+                for r in ranges {
+                    let a = r.0.max(1);
+                    let b = r.1.max(a);
+                    if a <= total_pages {
+                        pages.extend(a..=b.min(total_pages));
+                    }
+                }
+                pages.sort_unstable();
+                pages.dedup();
+            }
+        }
+        if pages.is_empty() {
+            unsafe { printing::discard_dc(dlg.hdc) };
+            self.status = tr(lang, "print.nopages").into();
+            return;
+        }
+        if pages.len() > printing::PRINT_PAGE_CAP {
+            unsafe { printing::discard_dc(dlg.hdc) };
+            self.status =
+                trf(lang, "print.toomany", &[&printing::PRINT_PAGE_CAP.to_string()]);
+            return;
+        }
+
+        // ---- 阶段 4：物化行文本（tab 借用随块结束） ----
+        let mut lines: Vec<String> = Vec::new();
+        {
+            let Some(tab) = self.active_mut() else {
+                unsafe { printing::discard_dc(dlg.hdc) };
+                return;
+            };
+            for p in &pages {
+                let l0 = base_line + ((*p as u64 - 1) * lpp);
+                let l1 = (l0 + lpp - 1).min(base_line + line_count - 1);
+                for line in l0..=l1 {
+                    let (_s, _e, text) =
+                        read_line_text(&tab.eb, true, &[], 0, 0, line);
+                    let mut t = text.replace('\t', "    ");
+                    if t.chars().count() > 8192 {
+                        t = t.chars().take(8192).collect();
+                    }
+                    lines.push(t);
+                }
+            }
+        }
+        self.print_rx = Some(printing::spool(
+            dlg.hdc,
+            Arc::new(lines),
+            lpp,
+            info.doc_name,
+            font_face,
+            font_pt,
+            dlg.printer,
+        ));
+    }
+
+    /// 解析 spool 线程的状态消息为本地化文本
+    fn print_status_text(m: &str, lang: Lang) -> String {
+        let mut it = m.splitn(3, '\t');
+        match it.next() {
+            Some("printing") => {
+                trf(lang, "print.status.printing", &[it.next().unwrap_or("0")])
+            }
+            Some("done") => {
+                let n = it.next().unwrap_or("0");
+                let p = it.next().unwrap_or("");
+                trf(lang, "print.status.done", &[n, p])
+            }
+            Some("fail") => tr(lang, "print.status.fail").into(),
+            _ => m.to_string(),
+        }
     }
 
     fn close_tab(&mut self, idx: usize) {
@@ -1483,7 +1663,6 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             install_cjk_font(&cc.egui_ctx);
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
             Ok(Box::new(App::new(cc)))
         }),
     )
@@ -1492,6 +1671,12 @@ fn main() -> eframe::Result<()> {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let lang = self.lang;
+        // 面板主题同步：首帧必发（None），theme_mode 变化后重发。
+        // 兜底 eframe/egui 对启动样式的任何延迟覆盖（系统主题事件、持久化恢复等）。
+        if self.applied_theme != Some(self.theme_mode) {
+            apply_panel_theme(ctx, self.theme_mode == ThemeMode::Dark);
+            self.applied_theme = Some(self.theme_mode);
+        }
         let th = editor_theme(self.theme_mode == ThemeMode::Dark);
         self.pointer_x = ctx
             .input(|i| i.pointer.latest_pos().map(|p| p.x).unwrap_or(f32::NAN));
@@ -1634,6 +1819,28 @@ impl eframe::App for App {
         }
         if self.is_loading() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        // ---- 轮询后台打印状态 ----
+        let mut print_msgs: Vec<String> = Vec::new();
+        let mut print_done = false;
+        if let Some(rx) = &self.print_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => print_msgs.push(m),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        print_done = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if print_done {
+            self.print_rx = None;
+        }
+        if let Some(m) = print_msgs.last() {
+            self.status = Self::print_status_text(m, lang);
         }
 
         // ---- 拖放文件 → 新标签页打开 ----
@@ -1804,14 +2011,23 @@ impl eframe::App for App {
                             );
                             ui.close();
                         }
+                        // 打印需行索引就绪且文档非空
+                        let printable = self
+                            .tabs
+                            .get(self.active)
+                            .map(|t| t.eb.has_index() && t.eb.line_count() > 0)
+                            .unwrap_or(false);
                         if ui
                             .add_enabled(
-                                false,
+                                printable,
                                 egui::Button::new(tr(lang, "file.print"))
                                     .shortcut_text("Ctrl+P"),
                             )
                             .clicked()
-                        {}
+                        {
+                            self.start_print();
+                            ui.close();
+                        }
                         ui.separator();
                         if ui
                             .add(
@@ -2381,6 +2597,12 @@ impl eframe::App for App {
                 self.eb_put_back(tab);
             });
 
+        // Ctrl+P（渲染期暂存，标签页已放回，此处处理）
+        if self.print_requested {
+            self.print_requested = false;
+            self.start_print();
+        }
+
         // ---- 设置窗口（模态：500x300，遮罩不可点击，Esc/✕ 关闭）----
         if self.show_settings {
             let lang = self.lang;
@@ -2420,12 +2642,14 @@ impl eframe::App for App {
                     ui.label(tr(lang, "settings.theme"));
                     ui.radio(self.theme_mode == ThemeMode::Light, tr(lang, "theme.light")).clicked().then(|| {
                         self.theme_mode = ThemeMode::Light;
-                        ctx.set_visuals(egui::Visuals::light());
+                        apply_panel_theme(ctx, false);
+                        self.applied_theme = Some(ThemeMode::Light);
                         save_settings(self.lang, self.theme_mode);
                     });
                     ui.radio(self.theme_mode == ThemeMode::Dark, tr(lang, "theme.dark")).clicked().then(|| {
                         self.theme_mode = ThemeMode::Dark;
-                        ctx.set_visuals(egui::Visuals::dark());
+                        apply_panel_theme(ctx, true);
+                        self.applied_theme = Some(ThemeMode::Dark);
                         save_settings(self.lang, self.theme_mode);
                     });
                 });
@@ -2991,6 +3215,10 @@ impl App {
                                 self.show_find = true;
                                 self.show_replace = true;
                                 self.focus_find = true;
+                            }
+                            egui::Key::P if modifiers.ctrl => {
+                                // 渲染期标签页已取出，暂存到 update 末尾处理
+                                self.print_requested = true;
                             }
                             _ => {}
                         }
