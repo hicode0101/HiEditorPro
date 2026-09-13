@@ -100,6 +100,14 @@ pub struct TabColors {
     pub dragging_border: Color32,
     /// 正被拖动的标签：文字颜色
     pub dragging_text: Color32,
+    /// 标签栏整条背景（标签带）
+    pub bar_bg: Color32,
+    /// 标签关闭按钮（×）颜色
+    pub close: Color32,
+    /// 关闭按钮悬停背景
+    pub close_hover_bg: Color32,
+    /// "＋"新建标签按钮颜色
+    pub new_tab: Color32,
 }
 
 /// 按主题取标签页配色。`dark = true` 返回深色，否则浅色。
@@ -108,6 +116,38 @@ pub fn tab_colors(dark: bool) -> TabColors {
         dark::TAB
     } else {
         light::TAB
+    }
+}
+
+// ---------- 查找/替换面板配色 ----------
+
+/// 查找/替换面板各控件配色。
+#[derive(Clone, Copy)]
+pub struct FindColors {
+    /// 面板背景
+    pub bar_bg: Color32,
+    /// 输入框背景
+    pub input_bg: Color32,
+    /// 输入框边框
+    pub input_border: Color32,
+    /// 按钮背景
+    pub btn_bg: Color32,
+    /// 按钮边框
+    pub btn_border: Color32,
+    /// 按钮文字
+    pub btn_text: Color32,
+    /// 按钮悬停背景
+    pub btn_hover_bg: Color32,
+    /// 关闭按钮（×）颜色
+    pub close: Color32,
+}
+
+/// 按主题取查找/替换面板配色。`dark = true` 返回深色，否则浅色。
+pub fn find_colors(dark: bool) -> FindColors {
+    if dark {
+        dark::FIND
+    } else {
+        light::FIND
     }
 }
 
@@ -154,6 +194,22 @@ pub mod light {
         dragging_bg: rgb(0xDCE9FB),
         dragging_border: rgb(0x0078D7),
         dragging_text: rgb(0x1F1F1F),
+        bar_bg: rgb(0xE9E9E9),
+        close: rgb(0x8A8A8A),
+        close_hover_bg: rgb(0xD8D8D8),
+        new_tab: rgb(0x5A5A5A),
+    };
+
+    /// 查找/替换面板配色（浅色：白底浅灰描边）
+    pub const FIND: FindColors = FindColors {
+        bar_bg: rgb(0xFAFAFA),
+        input_bg: rgb(0xFFFFFF),
+        input_border: rgb(0xC9C9C9),
+        btn_bg: rgb(0xFFFFFF),
+        btn_border: rgb(0xC0C0C0),
+        btn_text: rgb(0x333333),
+        btn_hover_bg: rgb(0xEFEFEF),
+        close: rgb(0x909090),
     };
 
     pub(crate) fn palette() -> EditorTheme {
@@ -217,6 +273,22 @@ pub mod dark {
         dragging_bg: rgb(0x2F3A4E),
         dragging_border: rgb(0x5A96E6),
         dragging_text: rgb(0xFFFFFF),
+        bar_bg: rgb(0x222227),
+        close: rgb(0x8A8A94),
+        close_hover_bg: rgb(0x33333A),
+        new_tab: rgb(0x9B9BA5),
+    };
+
+    /// 查找/替换面板配色（深色：深底灰描边）
+    pub const FIND: FindColors = FindColors {
+        bar_bg: rgb(0x25252B),
+        input_bg: rgb(0x2C2C32),
+        input_border: rgb(0x4A4A52),
+        btn_bg: rgb(0x35353C),
+        btn_border: rgb(0x4E4E56),
+        btn_text: rgb(0xE0E0E0),
+        btn_hover_bg: rgb(0x404048),
+        close: rgb(0x9B9BA5),
     };
 
     pub(crate) fn palette() -> EditorTheme {

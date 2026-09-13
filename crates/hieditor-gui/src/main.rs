@@ -1853,7 +1853,8 @@ impl eframe::App for App {
         let th = editor_theme(self.theme_mode == ThemeMode::Dark);
 
         // ---- 全局快捷键（不依赖编辑区焦点）----
-        // F3 / Shift+F3：搜索下一个/上一个；Ctrl+加号/减号/0：缩放
+        // F3 / Shift+F3：搜索下一个/上一个；Ctrl+加号/减号/0：缩放；
+        // Ctrl+F / Ctrl+H：查找/查找替换（查找面板开着时也可再按）
         {
             let mods = ctx.input(|i| i.modifiers);
             if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
@@ -1862,6 +1863,16 @@ impl eframe::App for App {
                 } else {
                     self.search_next(1);
                 }
+            }
+            if mods.ctrl && ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                self.show_find = true;
+                self.show_replace = false;
+                self.focus_find = true;
+            }
+            if mods.ctrl && ctx.input(|i| i.key_pressed(egui::Key::H)) {
+                self.show_find = true;
+                self.show_replace = true;
+                self.focus_find = true;
             }
             if mods.ctrl {
                 if ctx.input(|i| i.key_pressed(egui::Key::Plus))
@@ -2485,12 +2496,20 @@ impl eframe::App for App {
             ui.add_space(2.0);
         });
 
-        // ---- 标签页栏 ----
-        egui::TopBottomPanel::top("tab_bar").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
+        // ---- 标签页栏（卡片式自绘，配色见 theme.rs TabColors） ----
+        const TAB_W: f32 = 200.0;
+        const TAB_H: f32 = 30.0;
+        const TAB_CLOSE_W: f32 = 24.0;
+        egui::TopBottomPanel::top("tab_bar")
+            .frame(
+                egui::Frame::default()
+                    .fill(theme::tab_colors(self.theme_mode == ThemeMode::Dark).bar_bg)
+                    .inner_margin(3.0),
+            )
+            .show(ctx, |ui| {
                 let mut close_request: Option<usize> = None;
                 let mut new_rects: Vec<(u64, egui::Rect)> = Vec::new();
+                let tc = theme::tab_colors(self.theme_mode == ThemeMode::Dark);
 
                 // ---- 拖拽排序：命中测试用上一帧的 Tab 矩形 ----
                 let dragging_id = egui::DragAndDrop::payload::<u64>(ui.ctx()).map(|a| *a);
@@ -2521,6 +2540,7 @@ impl eframe::App for App {
                     }
                 }
 
+                ui.horizontal(|ui| {
                 for i in 0..self.tabs.len() {
                     let (title, dirty, is_loading) = {
                         let t = &self.tabs[i];
@@ -2530,69 +2550,98 @@ impl eframe::App for App {
                         }
                         (ti, t.eb.is_dirty(), t.is_loading())
                     };
-                    let label = if dirty {
+                    let is_dragging_this = dragging_id == Some(self.tabs[i].id);
+                    let is_active = i == self.active;
+                    let tab_id = egui::Id::new(("tab", self.tabs[i].id));
+
+                    let (tab_rect, tab_resp) = ui
+                        .allocate_exact_size(
+                            egui::vec2(TAB_W, TAB_H),
+                            egui::Sense::click_and_drag(),
+                        );
+                    // 四态配色：拖动 > 选中 > 悬停 > 常态
+                    let (bg, border, fg) = if is_dragging_this {
+                        (tc.dragging_bg, tc.dragging_border, tc.dragging_text)
+                    } else if is_active {
+                        (tc.selected_bg, tc.selected_border, tc.selected_text)
+                    } else if tab_resp.hovered() {
+                        (tc.hover_bg, tc.idle_border, tc.idle_text)
+                    } else {
+                        (tc.idle_bg, tc.idle_border, tc.idle_text)
+                    };
+                    let p = ui.painter_at(tab_rect);
+                    p.rect_filled(tab_rect, 3.0, bg);
+                    if border != egui::Color32::TRANSPARENT {
+                        p.rect_stroke(
+                            tab_rect,
+                            3.0,
+                            egui::Stroke::new(1.0_f32, border),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+
+                    // 标题（超宽按字符截断加省略号）+ 脏标记 + 加载中
+                    let mut label = if dirty {
                         format!("{title} •")
                     } else {
                         title.clone()
                     };
-                    let is_dragging_this = dragging_id == Some(self.tabs[i].id);
-                    // 标签页四态配色（选中/非选中/悬停/拖动）统一来自 theme.rs
-                    let tc = theme::tab_colors(self.theme_mode == ThemeMode::Dark);
-                    let is_active = i == self.active;
-                    let tab_resp = ui
-                        .scope(|ui| {
-                            let w = &mut ui.style_mut().visuals.widgets;
-                            let set = |wd: &mut egui::style::WidgetVisuals,
-                                       bg: egui::Color32,
-                                       border: egui::Color32,
-                                       text: egui::Color32| {
-                                wd.bg_fill = bg;
-                                wd.weak_bg_fill = bg;
-                                wd.bg_stroke = egui::Stroke::new(1.0_f32, border);
-                                wd.fg_stroke = egui::Stroke::new(1.0_f32, text);
-                            };
-                            set(
-                                &mut w.inactive,
-                                tc.idle_bg,
-                                tc.idle_border,
-                                tc.idle_text,
-                            );
-                            set(
-                                &mut w.hovered,
-                                tc.hover_bg,
-                                tc.idle_border,
-                                tc.idle_text,
-                            );
-                            set(
-                                &mut w.active,
-                                tc.selected_bg,
-                                tc.selected_border,
-                                tc.selected_text,
-                            );
-                            if is_dragging_this {
-                                set(
-                                    &mut w.inactive,
-                                    tc.dragging_bg,
-                                    tc.dragging_border,
-                                    tc.dragging_text,
-                                );
-                                set(
-                                    &mut w.hovered,
-                                    tc.dragging_bg,
-                                    tc.dragging_border,
-                                    tc.dragging_text,
-                                );
-                                set(
-                                    &mut w.active,
-                                    tc.dragging_bg,
-                                    tc.dragging_border,
-                                    tc.dragging_text,
-                                );
+                    if is_loading {
+                        label.push_str(" ⏳");
+                    }
+                    let text_w_max = TAB_W - TAB_CLOSE_W - 20.0;
+                    let mut shown = label.clone();
+                    loop {
+                        let g = ui.fonts(|f| {
+                            f.layout_no_wrap(
+                                shown.clone(),
+                                egui::FontId::proportional(13.0),
+                                fg,
+                            )
+                        });
+                        if g.rect.width() <= text_w_max || shown.chars().count() <= 1 {
+                            if shown.is_empty() {
+                                shown.push('…');
+                            } else if g.rect.width() > text_w_max {
+                                shown.pop();
+                                shown.push('…');
                             }
-                            ui.selectable_label(is_active && !is_dragging_this, egui::RichText::new(&label))
-                        })
-                        .inner
-                        .interact(egui::Sense::click_and_drag());
+                            break;
+                        }
+                        shown.pop();
+                    }
+                    p.text(
+                        egui::Pos2::new(tab_rect.left() + 10.0, tab_rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &shown,
+                        egui::FontId::proportional(13.0),
+                        fg,
+                    );
+
+                    // 关闭 ×（内嵌右侧，独立命中区）
+                    let close_rect = egui::Rect::from_center_size(
+                        egui::Pos2::new(
+                            tab_rect.right() - TAB_CLOSE_W / 2.0 - 4.0,
+                            tab_rect.center().y,
+                        ),
+                        egui::vec2(18.0, 18.0),
+                    );
+                    let close_resp =
+                        ui.interact(close_rect, tab_id.with("close"), egui::Sense::click());
+                    if close_resp.hovered() {
+                        p.rect_filled(close_rect, 3.0, tc.close_hover_bg);
+                    }
+                    p.text(                        close_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "×",
+                        egui::FontId::proportional(12.0),
+                        tc.close,
+                    );
+                    if close_resp.clicked() {
+                        close_request = Some(i);
+                    }
+                    close_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
                     if tab_resp.drag_started() {
                         egui::DragAndDrop::set_payload(ui.ctx(), self.tabs[i].id);
                         self.active = i;
@@ -2601,24 +2650,7 @@ impl eframe::App for App {
                         self.active = i;
                         self.editor_focused = true;
                     }
-                    new_rects.push((self.tabs[i].id, tab_resp.rect));
-
-                    let close_resp = ui
-                        .add(
-                            egui::Button::new(egui::RichText::new("×").size(12.0))
-                                .frame(false),
-                        )
-                        .on_hover_text(tr(lang, "tab.close"));
-                    if close_resp.clicked() {
-                        close_request = Some(i);
-                    }
-                    if is_loading && i == self.active {
-                        ui.label(
-                            egui::RichText::new("⏳")
-                                .color(theme_ui::TAB_LOADING_ICON),
-                        );
-                    }
-                    ui.add_space(4.0);
+                    new_rects.push((self.tabs[i].id, tab_rect));
 
                     // ---- Tab 右键菜单 ----
                     tab_resp.context_menu(|ui| {
@@ -2707,9 +2739,12 @@ impl eframe::App for App {
                 if ui
                     .add(
                         egui::Button::new(
-                            egui::RichText::new("＋").size(14.0),
+                            egui::RichText::new("＋")
+                                .size(15.0)
+                                .color(tc.new_tab),
                         )
-                        .frame(false),
+                        .frame(false)
+                        .min_size(egui::vec2(30.0, TAB_H)),
                     )
                     .on_hover_text(tr(lang, "tab.new"))
                     .clicked()
@@ -2723,9 +2758,8 @@ impl eframe::App for App {
                 if let Some(i) = close_request {
                     self.close_tab(i);
                 }
+                });
             });
-            ui.add_space(2.0);
-        });
 
         // ---- 查找/替换面板 ----
         if self.show_find {
@@ -2735,106 +2769,179 @@ impl eframe::App for App {
                 self.show_replace = false;
                 self.editor_focused = true;
             }
-            egui::TopBottomPanel::top("find_bar").show(ctx, |ui| {
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.label(tr(lang, "search.label"));
-                    let mut enter_find = false;
-                    let mut find_focused = false;
-                    if let Some(t) = self.active_mut() {
-                        let find_edit = ui.add_sized(
-                            [220.0, 20.0],
-                            egui::TextEdit::singleline(&mut t.search.input)
-                                .hint_text(tr(lang, "search.findhint")),
-                        );
-                        if self.focus_find {
-                            self.focus_find = false;
-                            find_edit.request_focus();
-                        }
-                        find_focused = find_edit.has_focus();
-                        // 查找框内按回车 = 跳到下一个命中
-                        enter_find = find_focused
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    }
-                    // 查找框持有焦点时必须停用编辑区键盘处理，
-                    // 否则输入会同时进查找框和编辑区（编辑器键盘只看 editor_focused 标志）
-                    if find_focused {
-                        self.editor_focused = false;
-                    }
-                    if ui.button(tr(lang, "search.next")).clicked() || enter_find {
-                        self.search_next(1);
-                    }
-                    if ui.button(tr(lang, "search.prev")).clicked() {
-                        self.search_next(-1);
-                    }
-                    if ui.button(tr(lang, "search.all")).clicked() {
-                        self.start_search();
-                    }
-                    let mut cs = self
-                        .active_mut()
-                        .map(|t| t.search.case_sensitive)
-                        .unwrap_or(false);
-                    if ui.checkbox(&mut cs, tr(lang, "search.case")).changed() {
-                        if let Some(t) = self.active_mut() {
-                            t.search.case_sensitive = cs;
-                        }
-                        // 选项变化 → 按新条件重新搜索
-                        self.start_search();
-                    }
-                    let mut ww = self
-                        .active_mut()
-                        .map(|t| t.search.whole_word)
-                        .unwrap_or(false);
-                    if ui.checkbox(&mut ww, tr(lang, "search.word")).changed() {
-                        if let Some(t) = self.active_mut() {
-                            t.search.whole_word = ww;
-                        }
-                        self.start_search();
-                    }
-                    let mut re = false;
-                    if ui
-                        .add_enabled(false, egui::Checkbox::without_text(&mut re))
-                        .on_hover_text(tr(lang, "search.regex_pending"))
-                        .changed()
+            let fc = theme::find_colors(self.theme_mode == ThemeMode::Dark);
+            egui::TopBottomPanel::top("find_bar")
+                .frame(
+                    egui::Frame::default()
+                        .fill(fc.bar_bg)
+                        .inner_margin(6.0),
+                )
+                .show(ctx, |ui| {
+                    // 面板控件观感：白底浅灰描边、4px 圆角、宽松间距（配色见 theme.rs FindColors）
+                    ui.style_mut().spacing.item_spacing = egui::vec2(10.0, 6.0);
                     {
-                        // 占位
+                        let v = &mut ui.style_mut().visuals;
+                        v.extreme_bg_color = fc.input_bg;
+                        for state in [
+                            &mut v.widgets.inactive,
+                            &mut v.widgets.hovered,
+                            &mut v.widgets.active,
+                        ] {
+                            state.corner_radius = egui::CornerRadius::same(4);
+                        }
+                        v.widgets.inactive.bg_fill = fc.btn_bg;
+                        v.widgets.inactive.weak_bg_fill = fc.btn_bg;
+                        v.widgets.inactive.bg_stroke =
+                            egui::Stroke::new(1.0_f32, fc.btn_border);
+                        v.widgets.inactive.fg_stroke =
+                            egui::Stroke::new(1.0_f32, fc.btn_text);
+                        v.widgets.hovered.bg_fill = fc.btn_hover_bg;
+                        v.widgets.hovered.weak_bg_fill = fc.btn_hover_bg;
                     }
-                    ui.label(egui::RichText::new(tr(lang, "search.regex")).weak());
-                    if ui.button("×").clicked() {
-                        self.show_find = false;
-                        self.show_replace = false;
-                    }
-                });
-                if self.show_replace {
-                    ui.horizontal(|ui| {
-                        ui.label(tr(lang, "search.replace"));
-                        let mut enter_replace = false;
-                        let mut repl_focused = false;
-                        if let Some(t) = self.active_mut() {
-                            let repl_edit = ui.add_sized(
-                                [220.0, 20.0],
-                                egui::TextEdit::singleline(&mut t.replace_input)
-                                    .hint_text(tr(lang, "search.replacehint")),
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            let mut enter_find = false;
+                            let mut find_focused = false;
+                            if let Some(t) = self.active_mut() {
+                                let find_edit = ui.add_sized(
+                                    [320.0, 26.0],
+                                    egui::TextEdit::singleline(&mut t.search.input)
+                                        .hint_text(tr(lang, "search.findhint")),
+                                );
+                                if self.focus_find {
+                                    self.focus_find = false;
+                                    find_edit.request_focus();
+                                }
+                                find_focused = find_edit.has_focus();
+                                // 查找框内按回车 = 跳到下一个命中
+                                enter_find = find_focused
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            }
+                            // 查找框持有焦点时必须停用编辑区键盘处理，
+                            // 否则输入会同时进查找框和编辑区（编辑器键盘只看 editor_focused 标志）
+                            if find_focused {
+                                self.editor_focused = false;
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(tr(lang, "search.next"))
+                                        .min_size(egui::vec2(76.0, 26.0)),
+                                )
+                                .clicked()
+                                || enter_find
+                            {
+                                self.search_next(1);
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(tr(lang, "search.prev"))
+                                        .min_size(egui::vec2(76.0, 26.0)),
+                                )
+                                .clicked()
+                            {
+                                self.search_next(-1);
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(tr(lang, "search.all"))
+                                        .min_size(egui::vec2(76.0, 26.0)),
+                                )
+                                .clicked()
+                            {
+                                self.start_search();
+                            }
+                            let mut cs = self
+                                .active_mut()
+                                .map(|t| t.search.case_sensitive)
+                                .unwrap_or(false);
+                            if ui.checkbox(&mut cs, tr(lang, "search.case")).changed() {
+                                if let Some(t) = self.active_mut() {
+                                    t.search.case_sensitive = cs;
+                                }
+                                // 选项变化 → 按新条件重新搜索
+                                self.start_search();
+                            }
+                            let mut ww = self
+                                .active_mut()
+                                .map(|t| t.search.whole_word)
+                                .unwrap_or(false);
+                            if ui.checkbox(&mut ww, tr(lang, "search.word")).changed() {
+                                if let Some(t) = self.active_mut() {
+                                    t.search.whole_word = ww;
+                                }
+                                self.start_search();
+                            }
+                            let mut re = false;
+                            if ui
+                                .add_enabled(false, egui::Checkbox::without_text(&mut re))
+                                .on_hover_text(tr(lang, "search.regex_pending"))
+                                .changed()
+                            {
+                                // 占位
+                            }
+                            ui.label(egui::RichText::new(tr(lang, "search.regex")).weak());
+                            // 面板关闭 ×（行尾右对齐）
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let close = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("×")
+                                                .size(14.0)
+                                                .color(fc.close),
+                                        )
+                                        .frame(false)
+                                        .min_size(egui::vec2(24.0, 24.0)),
+                                    );
+                                    if close.clicked() {
+                                        self.show_find = false;
+                                        self.show_replace = false;
+                                    }
+                                },
                             );
-                            repl_focused = repl_edit.has_focus();
-                            // 替换框内按回车 = 替换当前命中
-                            enter_replace = repl_focused
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        }
-                        // 同查找框：替换框持有焦点时停用编辑区键盘处理
-                        if repl_focused {
-                            self.editor_focused = false;
-                        }
-                        if ui.button(tr(lang, "search.replace")).clicked() || enter_replace {
-                            self.replace_current();
-                        }
-                        if ui.button(tr(lang, "search.replaceall")).clicked() {
-                            self.replace_all_in_active();
+                        });
+                        if self.show_replace {
+                            ui.horizontal(|ui| {
+                                let mut enter_replace = false;
+                                let mut repl_focused = false;
+                                if let Some(t) = self.active_mut() {
+                                    let repl_edit = ui.add_sized(
+                                        [320.0, 26.0],
+                                        egui::TextEdit::singleline(&mut t.replace_input)
+                                            .hint_text(tr(lang, "search.replacehint")),
+                                    );
+                                    repl_focused = repl_edit.has_focus();
+                                    // 替换框内按回车 = 替换当前命中
+                                    enter_replace = repl_focused
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                }
+                                // 同查找框：替换框持有焦点时停用编辑区键盘处理
+                                if repl_focused {
+                                    self.editor_focused = false;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(tr(lang, "search.replace"))
+                                            .min_size(egui::vec2(76.0, 26.0)),
+                                    )
+                                    .clicked()
+                                    || enter_replace
+                                {
+                                    self.replace_current();
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new(tr(lang, "search.replaceall"))
+                                            .min_size(egui::vec2(76.0, 26.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.replace_all_in_active();
+                                }
+                            });
                         }
                     });
-                }
-                ui.add_space(2.0);
-            });
+                });
         }
 
         // ---- 状态栏 ----
@@ -3562,16 +3669,6 @@ impl App {
                             }
                             egui::Key::S if modifiers.ctrl => {
                                 self.status = tab.do_save(lang);
-                            }
-                            egui::Key::F if modifiers.ctrl => {
-                                self.show_find = true;
-                                self.show_replace = false;
-                                self.focus_find = true;
-                            }
-                            egui::Key::H if modifiers.ctrl => {
-                                self.show_find = true;
-                                self.show_replace = true;
-                                self.focus_find = true;
                             }
                             egui::Key::P if modifiers.ctrl => {
                                 // 渲染期标签页已取出，暂存到 update 末尾处理
