@@ -2402,11 +2402,62 @@ impl eframe::App for App {
                         title.clone()
                     };
                     let is_dragging_this = dragging_id == Some(self.tabs[i].id);
+                    // 标签页四态配色（选中/非选中/悬停/拖动）统一来自 theme.rs
+                    let tc = theme::tab_colors(self.theme_mode == ThemeMode::Dark);
+                    let is_active = i == self.active;
                     let tab_resp = ui
-                        .selectable_label(
-                            i == self.active && !is_dragging_this,
-                            egui::RichText::new(&label),
-                        )
+                        .scope(|ui| {
+                            let w = &mut ui.style_mut().visuals.widgets;
+                            let set = |wd: &mut egui::style::WidgetVisuals,
+                                       bg: egui::Color32,
+                                       border: egui::Color32,
+                                       text: egui::Color32| {
+                                wd.bg_fill = bg;
+                                wd.weak_bg_fill = bg;
+                                wd.bg_stroke = egui::Stroke::new(1.0, border);
+                                wd.fg_stroke = egui::Stroke::new(1.0, text);
+                            };
+                            set(
+                                &mut w.inactive,
+                                tc.idle_bg,
+                                tc.idle_border,
+                                tc.idle_text,
+                            );
+                            set(
+                                &mut w.hovered,
+                                tc.hover_bg,
+                                tc.idle_border,
+                                tc.idle_text,
+                            );
+                            set(
+                                &mut w.active,
+                                tc.selected_bg,
+                                tc.selected_border,
+                                tc.selected_text,
+                            );
+                            if is_dragging_this {
+                                set(
+                                    &mut w.inactive,
+                                    tc.dragging_bg,
+                                    tc.dragging_border,
+                                    tc.dragging_text,
+                                );
+                                set(
+                                    &mut w.hovered,
+                                    tc.dragging_bg,
+                                    tc.dragging_border,
+                                    tc.dragging_text,
+                                );
+                                set(
+                                    &mut w.active,
+                                    tc.dragging_bg,
+                                    tc.dragging_border,
+                                    tc.dragging_text,
+                                );
+                            }
+                            ui.selectable_label(is_active && !is_dragging_this, egui::RichText::new(&label))
+                        })
+                        .inner
                         .interact(egui::Sense::click_and_drag());
                     if tab_resp.drag_started() {
                         egui::DragAndDrop::set_payload(ui.ctx(), self.tabs[i].id);

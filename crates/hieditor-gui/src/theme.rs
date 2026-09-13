@@ -74,6 +74,43 @@ pub fn editor_theme(dark: bool) -> EditorTheme {
     }
 }
 
+// ---------- 标签页（tab 选项卡）配色 ----------
+
+/// 标签页各状态配色（背景 / 边框 / 文字）。
+/// 边框统一 1px；背景/边框填 `Color32::TRANSPARENT` 即无背景/无边框。
+#[derive(Clone, Copy)]
+pub struct TabColors {
+    /// 选中标签：背景色
+    pub selected_bg: Color32,
+    /// 选中标签：边框颜色
+    pub selected_border: Color32,
+    /// 选中标签：文字颜色
+    pub selected_text: Color32,
+    /// 非选中标签：背景色
+    pub idle_bg: Color32,
+    /// 非选中标签：边框颜色
+    pub idle_border: Color32,
+    /// 非选中标签：文字颜色
+    pub idle_text: Color32,
+    /// 非选中标签：鼠标悬停时的背景色（文字/边框沿用非选中配色）
+    pub hover_bg: Color32,
+    /// 正被拖动的标签：背景色
+    pub dragging_bg: Color32,
+    /// 正被拖动的标签：边框颜色
+    pub dragging_border: Color32,
+    /// 正被拖动的标签：文字颜色
+    pub dragging_text: Color32,
+}
+
+/// 按主题取标签页配色。`dark = true` 返回深色，否则浅色。
+pub fn tab_colors(dark: bool) -> TabColors {
+    if dark {
+        dark::TAB
+    } else {
+        light::TAB
+    }
+}
+
 // ---------- 浅色主题 ----------
 
 /// 浅色主题（对齐原型图，默认主题）。
@@ -104,6 +141,20 @@ pub mod light {
     pub const THUMB: Color32 = rgb(0xBEBEBE);
     /// 正文文字：中灰（与浅色背景对比柔和）
     pub const TEXT: Color32 = rgb(0x666666);
+
+    /// 标签页配色（浅色：选中=白底蓝框，非选中=透明底灰字，拖动=淡蓝底蓝框）
+    pub const TAB: TabColors = TabColors {
+        selected_bg: rgb(0xFFFFFF),
+        selected_border: rgb(0x0078D7),
+        selected_text: rgb(0x1F1F1F),
+        idle_bg: Color32::TRANSPARENT,
+        idle_border: Color32::TRANSPARENT,
+        idle_text: rgb(0x444444),
+        hover_bg: rgb(0xE8E8E8),
+        dragging_bg: rgb(0xDCE9FB),
+        dragging_border: rgb(0x0078D7),
+        dragging_text: rgb(0x1F1F1F),
+    };
 
     pub(crate) fn palette() -> EditorTheme {
         EditorTheme {
@@ -153,6 +204,20 @@ pub mod dark {
     pub const THUMB: Color32 = rgb(0x6E6E82);
     /// 正文文字：中灰（嫌暗可调亮，如 rgb(0xC8C8D2)）
     pub const TEXT: Color32 = rgb(0xCCCCCC);
+
+    /// 标签页配色（深色：选中=编辑区底色亮蓝框，非选中=透明底灰字，拖动=深蓝底亮蓝框）
+    pub const TAB: TabColors = TabColors {
+        selected_bg: rgb(0x2C2C32),
+        selected_border: rgb(0x5A96E6),
+        selected_text: rgb(0xE8E8E8),
+        idle_bg: Color32::TRANSPARENT,
+        idle_border: Color32::TRANSPARENT,
+        idle_text: rgb(0x9B9BA5),
+        hover_bg: rgb(0x35353C),
+        dragging_bg: rgb(0x2F3A4E),
+        dragging_border: rgb(0x5A96E6),
+        dragging_text: rgb(0xFFFFFF),
+    };
 
     pub(crate) fn palette() -> EditorTheme {
         EditorTheme {
