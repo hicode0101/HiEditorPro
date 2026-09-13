@@ -53,6 +53,8 @@ pub struct EditorTheme {
     pub highlight: Color32,
     /// 搜索命中高亮背景色（当前定位的那一条）
     pub selected: Color32,
+    /// 当前搜索命中的文字颜色（叠加在 selected 背景之上，与正文文字色区分开）
+    pub selected_text: Color32,
     /// 光标（插入符）颜色
     pub cursor: Color32,
     /// 滚动条轨道颜色
@@ -89,9 +91,11 @@ pub mod light {
     /// 选中文本背景：淡蓝
     pub const SEL: Color32 = rgb(0xADD6FF);
     /// 搜索命中高亮：淡黄（VSCode 风格）
-    pub const HIGHLIGHT: Color32 = rgb(0xFFEC78);
+    pub const HIGHLIGHT: Color32 = rgb(0x40FF40);
     /// 当前搜索命中高亮：橙黄，比普通命中更醒目
-    pub const SELECTED: Color32 = rgb(0xFFBE50);
+    pub const SELECTED: Color32 = rgb(0x0078D7);
+    /// 当前搜索命中的文字：纯白（衬蓝色命中底色）
+    pub const SELECTED_TEXT: Color32 = rgb(0xFFFFFF);
     /// 光标：近黑
     pub const CURSOR: Color32 = rgb(0x141414);
     /// 滚动条轨道：与行号栏背景接近的浅灰
@@ -99,7 +103,7 @@ pub mod light {
     /// 滚动条滑块：比轨道深一档的灰
     pub const THUMB: Color32 = rgb(0xBEBEBE);
     /// 正文文字：中灰（与浅色背景对比柔和）
-    pub const TEXT: Color32 = rgb(0x888888);
+    pub const TEXT: Color32 = rgb(0x666666);
 
     pub(crate) fn palette() -> EditorTheme {
         EditorTheme {
@@ -110,6 +114,7 @@ pub mod light {
             sel: SEL,
             highlight: HIGHLIGHT,
             selected: SELECTED,
+            selected_text: SELECTED_TEXT,
             cursor: CURSOR,
             track: TRACK,
             thumb: THUMB,
@@ -135,9 +140,11 @@ pub mod dark {
     /// 选中文本背景：深蓝
     pub const SEL: Color32 = rgb(0x325AA0);
     /// 搜索命中高亮：暗琥珀
-    pub const HIGHLIGHT: Color32 = rgb(0x966E14);
+    pub const HIGHLIGHT: Color32 = rgb(0x109309);
     /// 当前搜索命中高亮：亮橙，比普通命中更醒目
     pub const SELECTED: Color32 = rgb(0xBE641E);
+    /// 当前搜索命中的文字：纯白（衬琥珀色命中底色）
+    pub const SELECTED_TEXT: Color32 = rgb(0xFFFFFF);
     /// 光标：近白
     pub const CURSOR: Color32 = rgb(0xEBEBEB);
     /// 滚动条轨道：略亮于背景的深灰
@@ -145,7 +152,7 @@ pub mod dark {
     /// 滚动条滑块：中灰
     pub const THUMB: Color32 = rgb(0x6E6E82);
     /// 正文文字：中灰（嫌暗可调亮，如 rgb(0xC8C8D2)）
-    pub const TEXT: Color32 = rgb(0x888888);
+    pub const TEXT: Color32 = rgb(0xCCCCCC);
 
     pub(crate) fn palette() -> EditorTheme {
         EditorTheme {
@@ -156,6 +163,7 @@ pub mod dark {
             sel: SEL,
             highlight: HIGHLIGHT,
             selected: SELECTED,
+            selected_text: SELECTED_TEXT,
             cursor: CURSOR,
             track: TRACK,
             thumb: THUMB,

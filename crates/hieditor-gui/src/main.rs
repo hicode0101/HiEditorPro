@@ -1306,6 +1306,14 @@ fn safe_slice(s: &str, r: std::ops::Range<usize>) -> String {
     s[lo..hi].to_string()
 }
 
+/// 把字节下标回退到最近的 UTF-8 字符边界（用于 LayoutJob 分段区间）。
+fn clamp_char_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
 /// 双击选词：包含 pos 的连续非空白字符段（遇空白结束，UTF-8 安全）。
 fn word_range_at(eb: &EditableBuffer, pos: u64) -> (u64, u64) {
     let line = eb.line_of_offset(pos);
@@ -3243,6 +3251,8 @@ impl App {
         let sel = tab.sel_range();
         let hits = tab.search.hits.clone();
         let selected_offset = hits.get(tab.search.selected).map(|h| h.offset);
+        let selected_range =
+            hits.get(tab.search.selected).map(|h| (h.offset, h.offset + h.len as u64));
         let cursor = tab.cursor;
         let cursor_line_visible = self.editor_focused && index_ready;
         let cursor_line = if index_ready { tab.eb.line_of_offset(cursor) } else { 0 };
@@ -3371,8 +3381,34 @@ impl App {
                 }
             }
 
-            // 整行文本
-            let galley = if wrap {
+            // 整行文本；当前命中的文字段用主题的 selected_text 颜色（多 section 排版）
+            let sel_span = selected_range.and_then(|(hs, he)| {
+                let line_end = s + text_bytes as u64;
+                (hs >= s && he > hs && he <= line_end)
+                    .then(|| ((hs - s) as usize, (he - s) as usize))
+            });
+            let galley = if let Some((a, b)) = sel_span {
+                let a = clamp_char_boundary(&text, a);
+                let b = clamp_char_boundary(&text, b).max(a);
+                let mut job = egui::text::LayoutJob::default();
+                job.text = text.clone();
+                let mut push = |r: std::ops::Range<usize>, color| {
+                    if r.start < r.end {
+                        job.sections.push(egui::text::LayoutSection {
+                            leading_space: 0.0,
+                            byte_range: r,
+                            format: egui::TextFormat::simple(font.clone(), color),
+                        });
+                    }
+                };
+                push(0..a, th.text);
+                push(a..b, th.selected_text);
+                push(b..text.len(), th.text);
+                if wrap {
+                    job.wrap.max_width = text_w;
+                }
+                ui.fonts(|f| f.layout_job(job))
+            } else if wrap {
                 ui.fonts(|f| f.layout(text.clone(), font.clone(), th.text, text_w))
             } else {
                 ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), th.text))
