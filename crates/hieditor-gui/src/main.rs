@@ -3664,18 +3664,32 @@ impl App {
             );
         }
 
-        // ---- 索引进度角标 ----
+        // ---- 索引进度角标（深色背景条 + 琥珀文字） ----
         if !index_ready {
             let pct = if tab.load_total > 0 {
                 (tab.covered_bytes * 100 / tab.load_total).min(100)
             } else {
                 0
             };
-            painter.text(
-                egui::Pos2::new(rect.right() - TRACK - 12.0, rect.top() + 8.0),
-                egui::Align2::RIGHT_TOP,
-                trf(lang, "editor.indexing", &[&pct.to_string()]),
-                egui::FontId::proportional(13.0),
+            let msg = trf(lang, "editor.indexing", &[&pct.to_string()]);
+            let font = egui::FontId::proportional(13.0);
+            let galley = ui.fonts(|f| f.layout_no_wrap(msg, font, theme_ui::INDEXING_BADGE));
+            let (pad_x, pad_y) = (10.0, 4.0);
+            let badge_size = egui::Vec2::new(
+                galley.rect.width() + pad_x * 2.0,
+                galley.rect.height() + pad_y * 2.0,
+            );
+            let badge_rect = egui::Rect::from_min_size(
+                egui::Pos2::new(
+                    rect.right() - TRACK - 12.0 - badge_size.x,
+                    rect.top() + 8.0,
+                ),
+                badge_size,
+            );
+            painter.rect_filled(badge_rect, 4.0, theme_ui::indexing_badge_bg());
+            painter.galley(
+                egui::Pos2::new(badge_rect.left() + pad_x, badge_rect.top() + pad_y),
+                galley,
                 theme_ui::INDEXING_BADGE,
             );
         }

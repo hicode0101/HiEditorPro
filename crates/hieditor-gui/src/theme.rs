@@ -192,6 +192,11 @@ pub mod ui {
     pub const TAB_LOADING_ICON: Color32 = rgb(0xDCA03C);
     /// 编辑区右上角"建索引中 N%"角标文字的琥珀色
     pub const INDEXING_BADGE: Color32 = rgb(0xDC9628);
+    /// 建索引进度提示条的背景（半透明深色圆角条，深浅主题下均清晰可读）。
+    /// （带透明度的构造非 const，无法声明为常量，故用函数）
+    pub fn indexing_badge_bg() -> Color32 {
+        Color32::from_rgba_unmultiplied(30, 30, 34, 200)
+    }
 
     /// 状态栏"●未保存"标记的橙色
     pub const DIRTY_MARK: Color32 = rgb(0xC8781E);
