@@ -146,6 +146,10 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "search.findhint") => if zh { "输入查找内容回车" } else { "Find, Enter to search" },
         (_, "search.replacehint") => if zh { "输入替换内容" } else { "Replacement" },
         (_, "view.wrap") => if zh { "自动换行" } else { "Wrap lines" },
+        (_, "view.zoom") => if zh { "缩放" } else { "Zoom" },
+        (_, "view.zoom_in") => if zh { "放大" } else { "Zoom In" },
+        (_, "view.zoom_out") => if zh { "缩小" } else { "Zoom Out" },
+        (_, "view.zoom_reset") => if zh { "恢复默认缩放" } else { "Reset Zoom" },
         (_, "toolbar.font") => if zh { "字体" } else { "Font" },
         (_, "toolbar.size") => if zh { "字号" } else { "Size" },
         (_, "font.default") => if zh { "默认字体" } else { "Default font" },
@@ -413,6 +417,8 @@ struct Tab {
     wrap_skip: u64,
     h_scroll: f32,
     h_extent: f32,
+    /// 滚动条拖拽锁定：0=无，1=纵向，2=横向（拖动中指针滑出轨道仍保持滚动条模式）
+    scroll_drag: u8,
     last_cursor: u64,
     wrap_rows: HashMap<u64, u32>,
     last_wrap_w: f32,
@@ -436,6 +442,7 @@ impl Tab {
             wrap_skip: 0,
             h_scroll: 0.0,
             h_extent: 0.0,
+            scroll_drag: 0,
             last_cursor: 0,
             wrap_rows: HashMap::new(),
             last_wrap_w: 0.0,
@@ -722,6 +729,9 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (lang, theme_mode) = load_settings();
         apply_panel_theme(&cc.egui_ctx, theme_mode == ThemeMode::Dark);
+        // Ctrl+加号/减号/0 由本程序接管（编辑区字号缩放）；
+        // 关闭 egui 原生的整体 UI 键盘缩放，避免两套缩放互相干扰
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let (font_choices, fonts_loaded, fonts_failed) = build_font_choices();
         let mut app = Self {
             tabs: Vec::new(),
@@ -777,6 +787,27 @@ impl App {
 
     fn active_mut(&mut self) -> Option<&mut Tab> {
         self.tabs.get_mut(self.active)
+    }
+
+    /// 编辑区缩放：按系数调整字号（0.5px 步进，8~40px），并失效全部标签页的排版缓存
+    fn zoom_editor(&mut self, factor: f32) {
+        let s = self.font_size * factor;
+        self.font_size = ((s * 2.0).round() / 2.0).clamp(8.0, 40.0);
+        for t in &mut self.tabs {
+            t.wrap_rows.clear();
+            t.wrap_skip = 0;
+            t.h_scroll = 0.0;
+        }
+    }
+
+    /// 恢复默认字号（15px）
+    fn zoom_reset(&mut self) {
+        self.font_size = 15.0;
+        for t in &mut self.tabs {
+            t.wrap_rows.clear();
+            t.wrap_skip = 0;
+            t.h_scroll = 0.0;
+        }
     }
 
     fn is_loading(&self) -> bool {
@@ -1686,6 +1717,30 @@ impl eframe::App for App {
             self.applied_theme = Some(self.theme_mode);
         }
         let th = editor_theme(self.theme_mode == ThemeMode::Dark);
+
+        // ---- 全局快捷键（不依赖编辑区焦点）----
+        // F3 / Shift+F3：搜索下一个/上一个；Ctrl+加号/减号/0：缩放
+        {
+            let mods = ctx.input(|i| i.modifiers);
+            if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
+                if mods.shift {
+                    self.search_next(-1);
+                } else {
+                    self.search_next(1);
+                }
+            }
+            if mods.ctrl {
+                if ctx.input(|i| i.key_pressed(egui::Key::Plus))
+                    || ctx.input(|i| i.key_pressed(egui::Key::Equals))
+                {
+                    self.zoom_editor(1.2);
+                } else if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
+                    self.zoom_editor(1.0 / 1.2);
+                } else if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
+                    self.zoom_reset();
+                }
+            }
+        }
         self.pointer_x = ctx
             .input(|i| i.pointer.latest_pos().map(|p| p.x).unwrap_or(f32::NAN));
         self.pointer_x = ctx
@@ -2085,40 +2140,74 @@ impl eframe::App for App {
                                 )
                             })
                             .unwrap_or((false, false, false, 0));
-                        if ui.add_enabled(can_undo, egui::Button::new(tr(lang, "edit.undo"))).clicked() {
+                        if ui
+                            .add_enabled(
+                                can_undo,
+                                egui::Button::new(tr(lang, "edit.undo")).shortcut_text("Ctrl+Z"),
+                            )
+                            .clicked()
+                        {
                             if let Some(t) = self.active_mut() {
                                 t.do_undo();
                             }
                             ui.close();
                         }
-                        if ui.add_enabled(can_redo, egui::Button::new(tr(lang, "edit.redo"))).clicked() {
+                        if ui
+                            .add_enabled(
+                                can_redo,
+                                egui::Button::new(tr(lang, "edit.redo")).shortcut_text("Ctrl+Y"),
+                            )
+                            .clicked()
+                        {
                             if let Some(t) = self.active_mut() {
                                 t.do_redo();
                             }
                             ui.close();
                         }
                         ui.separator();
-                        if ui.add_enabled(len > 0, egui::Button::new(tr(lang, "edit.selectall"))).clicked() {
+                        if ui
+                            .add_enabled(
+                                len > 0,
+                                egui::Button::new(tr(lang, "edit.selectall"))
+                                    .shortcut_text("Ctrl+A"),
+                            )
+                            .clicked()
+                        {
                             if let Some(t) = self.active_mut() {
                                 t.anchor = Some(0);
                                 t.cursor = t.eb.len();
                             }
                             ui.close();
                         }
-                        if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.cut"))).clicked() {
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new(tr(lang, "edit.cut")).shortcut_text("Ctrl+X"),
+                            )
+                            .clicked()
+                        {
                             if let Some(t) = self.active_mut() {
                                 t.cut_selection();
                             }
                             ui.close();
                         }
-                        if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.copy"))).clicked() {
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new(tr(lang, "edit.copy")).shortcut_text("Ctrl+C"),
+                            )
+                            .clicked()
+                        {
                             if let Some(t) = self.active_mut() {
                                 t.copy_selection();
                             }
                             ui.close();
                         }
                         if ui
-                            .add_enabled(clipboard_get().is_some(), egui::Button::new(tr(lang, "edit.paste")))
+                            .add_enabled(
+                                clipboard_get().is_some(),
+                                egui::Button::new(tr(lang, "edit.paste")).shortcut_text("Ctrl+V"),
+                            )
                             .clicked()
                         {
                             if let Some(t) = self.active_mut() {
@@ -2126,7 +2215,13 @@ impl eframe::App for App {
                             }
                             ui.close();
                         }
-                        if ui.add_enabled(has_sel, egui::Button::new(tr(lang, "edit.delete"))).clicked() {
+                        if ui
+                            .add_enabled(
+                                has_sel,
+                                egui::Button::new(tr(lang, "edit.delete")).shortcut_text("Del"),
+                            )
+                            .clicked()
+                        {
                             if let Some(t) = self.active_mut() {
                                 t.delete_selection();
                             }
@@ -2150,15 +2245,39 @@ impl eframe::App for App {
                     });
                     ui.menu_button(tr(lang, "menu.view"), |ui| {
                         ui.set_min_width(130.0);
-                        let mut w = self.wrap;
-                        if ui.checkbox(&mut w, tr(lang, "view.wrap")).changed() {
-                            self.wrap = w;
-                            if let Some(t) = self.active_mut() {
-                                t.wrap_skip = 0;
-                                t.wrap_rows.clear();
-                                t.h_scroll = 0.0;
+                        ui.menu_button(tr(lang, "view.zoom"), |ui| {
+                            ui.set_min_width(160.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(tr(lang, "view.zoom_in"))
+                                        .shortcut_text("Ctrl + 加号"),
+                                )
+                                .clicked()
+                            {
+                                self.zoom_editor(1.2);
+                                ui.close();
                             }
-                        }
+                            if ui
+                                .add(
+                                    egui::Button::new(tr(lang, "view.zoom_out"))
+                                        .shortcut_text("Ctrl + 减号"),
+                                )
+                                .clicked()
+                            {
+                                self.zoom_editor(1.0 / 1.2);
+                                ui.close();
+                            }
+                            if ui
+                                .add(
+                                    egui::Button::new(tr(lang, "view.zoom_reset"))
+                                        .shortcut_text("Ctrl + 0"),
+                                )
+                                .clicked()
+                            {
+                                self.zoom_reset();
+                                ui.close();
+                            }
+                        });
                     });
                     if ui.button(tr(lang, "menu.about")).clicked() {
                         self.show_about = true;
@@ -2219,6 +2338,14 @@ impl eframe::App for App {
                             }
                         }
                     });
+                // 自动换行开关（原"查看"菜单项移至此处）
+                if ui.checkbox(&mut self.wrap, tr(lang, "view.wrap")).changed() {
+                    for t in &mut self.tabs {
+                        t.wrap_rows.clear();
+                        t.wrap_skip = 0;
+                        t.h_scroll = 0.0;
+                    }
+                }
                 let _ = ui.button("…"); // 预留：更多工具栏入口
             });
             ui.add_space(2.0);
@@ -2428,6 +2555,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.label(tr(lang, "search.label"));
                     let mut enter_find = false;
+                    let mut find_focused = false;
                     if let Some(t) = self.active_mut() {
                         let find_edit = ui.add_sized(
                             [220.0, 20.0],
@@ -2438,9 +2566,15 @@ impl eframe::App for App {
                             self.focus_find = false;
                             find_edit.request_focus();
                         }
+                        find_focused = find_edit.has_focus();
                         // 查找框内按回车 = 跳到下一个命中
-                        enter_find = find_edit.has_focus()
+                        enter_find = find_focused
                             && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    }
+                    // 查找框持有焦点时必须停用编辑区键盘处理，
+                    // 否则输入会同时进查找框和编辑区（编辑器键盘只看 editor_focused 标志）
+                    if find_focused {
+                        self.editor_focused = false;
                     }
                     if ui.button(tr(lang, "search.next")).clicked() || enter_find {
                         self.search_next(1);
@@ -2490,15 +2624,21 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.label(tr(lang, "search.replace"));
                         let mut enter_replace = false;
+                        let mut repl_focused = false;
                         if let Some(t) = self.active_mut() {
                             let repl_edit = ui.add_sized(
                                 [220.0, 20.0],
                                 egui::TextEdit::singleline(&mut t.replace_input)
                                     .hint_text(tr(lang, "search.replacehint")),
                             );
+                            repl_focused = repl_edit.has_focus();
                             // 替换框内按回车 = 替换当前命中
-                            enter_replace = repl_edit.has_focus()
+                            enter_replace = repl_focused
                                 && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        }
+                        // 同查找框：替换框持有焦点时停用编辑区键盘处理
+                        if repl_focused {
+                            self.editor_focused = false;
                         }
                         if ui.button(tr(lang, "search.replace")).clicked() || enter_replace {
                             self.replace_current();
@@ -2556,7 +2696,9 @@ impl eframe::App for App {
                         ui.separator();
                         ui.label(t.eb.encoding().name());
                         ui.separator();
-                        ui.label("100%");
+                        // 缩放百分比：相对默认字号 15px（18px → 120%，12.5px → 83%）
+                        let zoom_pct = (self.font_size / 15.0 * 100.0).round() as i32;
+                        ui.label(format!("{zoom_pct}%"));
                     }
                     ui.separator();
                     if self
@@ -2836,10 +2978,6 @@ impl App {
 
         // ---- 布局与度量 ----
         let (rect, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-        // 文本区悬停显示 I 形光标
-        if response.hovered() {
-            ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
-        }
         let painter = ui.painter_at(rect);
         let font = egui::FontId::monospace(self.font_size);
         let digit_w = ui
@@ -2939,20 +3077,46 @@ impl App {
             };
 
         // ---- 鼠标 ----
-        let pointer_pos = response.interact_pointer_pos();
+        // 悬停时用 hover_pos（interact_pointer_pos 仅在按下/拖动时有值）
+        let pointer_pos =
+            response.hover_pos().or_else(|| response.interact_pointer_pos());
         let in_htrack = pointer_pos
             .map(|p| htrack.top() <= p.y && p.x >= text_left && !wrap)
             .unwrap_or(false);
         let in_vtrack = pointer_pos.map(|p| p.x >= vtrack.left()).unwrap_or(false);
+        // 拖拽起点锁定：拖动滑块时指针滑出轨道仍保持滚动条模式（不会掉进正文拖选）
+        if response.drag_started() {
+            tab.scroll_drag = if in_htrack {
+                2
+            } else if in_vtrack {
+                1
+            } else {
+                0
+            };
+        } else if response.drag_stopped() || response.clicked_elsewhere() {
+            tab.scroll_drag = 0;
+        }
+        let hit_h = in_htrack || (response.dragged() && tab.scroll_drag == 2);
+        let hit_v = !hit_h && (in_vtrack || (response.dragged() && tab.scroll_drag == 1));
+
+        // 鼠标图标：滚动条区域（悬停/拖动中）= 箭头，正文区 = I 形
+        if in_htrack
+            || in_vtrack
+            || (response.dragged() && tab.scroll_drag > 0)
+        {
+            ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::Default);
+        } else if response.hovered() {
+            ui.ctx().output_mut(|o| o.cursor_icon = egui::CursorIcon::Text);
+        }
         if index_ready {
-            if in_htrack {
+            if hit_h {
                 if response.clicked() || response.dragged() {
                     let p = pointer_pos.unwrap();
                     let denom = (htrack.width() - h_thumb_w).max(1.0);
                     let ratio = ((p.x - htrack.left()) - h_thumb_w / 2.0).max(0.0) / denom;
                     tab.h_scroll = (ratio.clamp(0.0, 1.0) * h_max).min(h_max);
                 }
-            } else if in_vtrack {
+            } else if hit_v {
                 if response.clicked() || response.dragged() {
                     let p = pointer_pos.unwrap();
                     let ratio = ((p.y - vtrack.top()) - thumb_h / 2.0).max(0.0)
@@ -3300,6 +3464,13 @@ impl App {
             egui::Stroke::new(1.0_f32, th.gutter_sep),
         );
 
+        // 正文区裁剪：横向滚动后正文/选区/命中/光标一律裁剪在行号栏右侧，
+        // 不允许盖到行号栏上（行号栏画在下层，靠此裁剪保持可见）
+        let text_painter = painter.with_clip_rect(egui::Rect::from_min_max(
+            egui::Pos2::new(text_left, rect.top()),
+            egui::Pos2::new(rect.right(), rect.bottom()),
+        ));
+
         let mut y = if wrap {
             rect.top() - tab.wrap_skip as f32 * line_height
         } else {
@@ -3340,7 +3511,7 @@ impl App {
                 let b = se.max(s).min(s_end);
                 if a < b {
                     for (r, xf, xt) in span_rows(&text, (a - s) as usize, (b - s) as usize) {
-                        painter.rect_filled(
+                        text_painter.rect_filled(
                             egui::Rect::from_min_size(
                                 egui::Pos2::new(text_left + xf - h_scroll, y + r as f32 * line_height),
                                 egui::Vec2::new((xt - xf).max(2.0), line_height),
@@ -3363,7 +3534,7 @@ impl App {
                     continue;
                 }
                 for (r, xf, xt) in span_rows(&text, (h.offset - s) as usize, (b - s) as usize) {
-                    painter.rect_filled(
+                    text_painter.rect_filled(
                         egui::Rect::from_min_size(
                             egui::Pos2::new(
                                 text_left + xf - h_scroll,
@@ -3415,7 +3586,7 @@ impl App {
             };
             let rows_used = galley.rows.len().max(1) as u32;
             let galley_w = galley.rect.width();
-            painter.galley(
+            text_painter.galley(
                 egui::Pos2::new(text_left - h_scroll, y + text_top_pad),
                 galley,
                 th.text,
@@ -3434,7 +3605,7 @@ impl App {
                         th.gutter_fg,
                     )
                 });
-                painter.galley(
+                text_painter.galley(
                     egui::Pos2::new(
                         text_left + tx - h_scroll + 4.0,
                         y + tr as f32 * line_height + text_top_pad,
@@ -3452,7 +3623,7 @@ impl App {
                     egui::Pos2::new(text_left + x - h_scroll, y + r as f32 * line_height),
                     egui::Vec2::new(2.0, line_height),
                 );
-                painter.rect_filled(cursor_rect, 0.0, th.cursor);
+                text_painter.rect_filled(cursor_rect, 0.0, th.cursor);
                 ui.ctx().output_mut(|o| {
                     o.ime = Some(egui::output::IMEOutput {
                         rect: cursor_rect.expand(2.0),
@@ -3464,6 +3635,8 @@ impl App {
             y += rows_used as f32 * line_height;
             line += 1;
         }
+        // 可视行中的最大行宽 → 横向滚动条依据（"UI界面大调整"时丢失的回归修复）
+        tab.h_extent = max_w_seen;
 
         // ---- 垂直滚动条 ----
         painter.rect_filled(vtrack, 2.0, th.track);

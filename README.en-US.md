@@ -123,10 +123,11 @@ Key shortcuts:
 | Shortcut | Action | Shortcut | Action |
 |---|---|---|---|
 | Ctrl+N / Ctrl+Shift+N | New tab / new window | Ctrl+F / Ctrl+H | Find / Find & Replace |
-| Ctrl+O | Open file | Enter | Next match (in find box) |
+| Ctrl+O | Open file | F3 / Shift+F3 | Next / previous match |
 | Ctrl+S / Ctrl+Shift+S | Save / Save as | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+Alt+S | Save all | Ctrl+C/X/V/A | Copy / cut / paste / select all |
 | Ctrl+P | Print | Ctrl+W | Close tab |
+| Ctrl+Plus / Minus / 0 | Zoom in / out / reset | | |
 
 Custom fonts: create a `fonts` folder next to the exe, drop in `.ttf/.otf/.ttc` files, restart,
 and pick them from the font dropdown.

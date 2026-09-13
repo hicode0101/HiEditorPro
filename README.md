@@ -117,12 +117,11 @@ hieditor-gui                     # 空窗口，可拖入文件或 Ctrl+O 打开
 | 快捷键 | 功能 | 快捷键 | 功能 |
 |---|---|---|---|
 | Ctrl+N / Ctrl+Shift+N | 新建标签页 / 新建窗口 | Ctrl+F / Ctrl+H | 查找 / 查找替换 |
-| Ctrl+O | 打开文件 | Enter / Shift+Enter* | 下一个 / 上一个命中 |
+| Ctrl+O | 打开文件 | F3 / Shift+F3 | 下一个 / 上一个命中 |
 | Ctrl+S / Ctrl+Shift+S | 保存 / 另存为 | Ctrl+Z / Ctrl+Y | 撤销 / 重做 |
 | Ctrl+Alt+S | 全部保存 | Ctrl+C/X/V/A | 复制/剪切/粘贴/全选 |
 | Ctrl+P | 打印 | Ctrl+W | 关闭标签页 |
-
-<sub>*在查找输入框内</sub>
+| Ctrl+加号 / 减号 / 0 | 放大 / 缩小 / 恢复默认缩放 | | |
 
 自定义字体：在 exe 旁新建 `fonts` 文件夹放入 `.ttf/.otf/.ttc`，重启后在字体下拉中选择。
 
