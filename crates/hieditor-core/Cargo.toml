@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 memmap2 = { workspace = true }
+encoding_rs = { workspace = true }
 memchr = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

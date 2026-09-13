@@ -475,8 +475,9 @@ impl EditableBuffer {
         needle: &[u8],
         replacement: &[u8],
         case_insensitive: bool,
+        gbk: bool,
     ) -> usize {
-        let hits = self.find_all(needle, case_insensitive);
+        let hits = self.find_all(needle, case_insensitive, gbk);
         if hits.is_empty() {
             return 0;
         }
@@ -558,12 +559,15 @@ impl EditableBuffer {
     }
 
     /// 全文查找全部命中（虚拟偏移, 长度；顺序左到右不重叠）。
-    pub fn find_all(&self, needle: &[u8], case_insensitive: bool) -> Vec<(u64, u64)> {
+    /// `gbk = true` 时大小写折叠跳过 GBK 双字节序列的次字节。
+    pub fn find_all(&self, needle: &[u8], case_insensitive: bool, gbk: bool) -> Vec<(u64, u64)> {
         if needle.is_empty() {
             return Vec::new();
         }
         let eff = if case_insensitive {
-            needle.to_ascii_lowercase()
+            let mut n = needle.to_vec();
+            crate::storage::encoding::fold_ascii(&mut n, gbk);
+            n
         } else {
             needle.to_vec()
         };
@@ -580,7 +584,7 @@ impl EditableBuffer {
                 break;
             }
             if case_insensitive {
-                buf.make_ascii_lowercase();
+                crate::storage::encoding::fold_ascii(&mut buf, gbk);
             }
             for rel in finder.find_iter(&buf) {
                 let abs = w + rel as u64;
@@ -953,10 +957,50 @@ mod tests {
     }
 
     #[test]
+    fn gbk_open_edit_save_roundtrip() {
+        // "你好\n世界" 的 GBK 字节：C4E3 BAC3 0A CAC0 BDE7
+        let p = std::env::temp_dir().join("hieditor_gbk_roundtrip.log");
+        std::fs::write(
+            &p,
+            [0xC4u8, 0xE3, 0xBA, 0xC3, b'\n', 0xCA, 0xC0, 0xBD, 0xE7],
+        )
+        .unwrap();
+        let mut eb = EditableBuffer::open(&p, &OpenOptions::default()).unwrap();
+        assert_eq!(eb.encoding().name(), "GBK/GB2312");
+        // 行 1 解码
+        let (s, e) = eb.line_bounds(0);
+        let mut buf = vec![0u8; (e - s) as usize];
+        eb.read(s, &mut buf).unwrap();
+        while matches!(buf.last(), Some(0x0A) | Some(0x0D)) {
+            buf.pop();
+        }
+        assert_eq!(eb.encoding().decode_str(&buf), "你好");
+        // 行 2 解码
+        let (s2, e2) = eb.line_bounds(1);
+        let mut buf2 = vec![0u8; (e2 - s2) as usize];
+        eb.read(s2, &mut buf2).unwrap();
+        while matches!(buf2.last(), Some(0x0A) | Some(0x0D)) {
+            buf2.pop();
+        }
+        assert_eq!(eb.encoding().decode_str(&buf2), "世界");
+        // 插入 "中文"（GBK 编码）到文件头并保存，文件字节仍是 GBK
+        let ins = eb.encoding().encode_str("中文");
+        eb.insert(s, &ins).unwrap();
+        eb.save().unwrap();
+        let raw = std::fs::read(&p).unwrap();
+        assert_eq!(&raw[..ins.len()], &ins[..]);
+        assert_eq!(raw.len(), ins.len() + 9);
+        // 保存后重开仍为 GBK 且行数一致（插入无换行，仍 2 行）
+        let eb2 = EditableBuffer::open(&p, &OpenOptions::default()).unwrap();
+        assert_eq!(eb2.line_count(), 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn replace_all_matches_reference() {
         // 相邻命中 + 替换文本长于查找词 + 整批撤销/重做
         let mut eb = EditableBuffer::from_vec(b"abXabXXab".to_vec());
-        assert_eq!(eb.replace_all(b"ab", b"[-]", false), 3);
+        assert_eq!(eb.replace_all(b"ab", b"[-]", false, false), 3);
         let mut out = vec![0u8; eb.len() as usize];
         eb.read(0, &mut out).unwrap();
         assert_eq!(out, b"[-]X[-]XX[-]");
@@ -977,12 +1021,12 @@ mod tests {
     fn replace_all_case_insensitive_and_no_hit() {
         // "Abc" 与 "ABC" 都被大小写不敏感命中，相邻命中各自替换
         let mut eb = EditableBuffer::from_vec(b"aAbcABC".to_vec());
-        assert_eq!(eb.replace_all(b"abc", b"Z", true), 2);
+        assert_eq!(eb.replace_all(b"abc", b"Z", true, false), 2);
         let mut out = vec![0u8; eb.len() as usize];
         eb.read(0, &mut out).unwrap();
         assert_eq!(out, b"aZZ");
         // 无命中：内容不变，也不产生撤销命令
-        assert_eq!(eb.replace_all(b"nope", b"Z", false), 0);
+        assert_eq!(eb.replace_all(b"nope", b"Z", false, false), 0);
         assert_eq!(eb.undo_depth(), 1);
     }
 
@@ -992,7 +1036,7 @@ mod tests {
         let mut eb = EditableBuffer::from_vec(b"hello world hello".to_vec());
         eb.insert(5, b"!").unwrap(); // hello! world hello
         eb.delete(0, 1).unwrap(); // ello! world hello
-        assert_eq!(eb.replace_all(b"o", b"0", false), 3);
+        assert_eq!(eb.replace_all(b"o", b"0", false, false), 3);
         let mut out = vec![0u8; eb.len() as usize];
         eb.read(0, &mut out).unwrap();
         assert_eq!(out, b"ell0! w0rld hell0");

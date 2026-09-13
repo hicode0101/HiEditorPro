@@ -514,8 +514,10 @@ impl Tab {
         if let Some((_, en)) = range {
             let _ = self.eb.delete(pos, en - pos);
         }
-        if self.eb.insert(pos, s.as_bytes()).is_ok() {
-            self.cursor = pos + s.len() as u64;
+        // 按文件编码落盘（GBK 文件把输入转 GBK 字节）
+        let bytes = self.eb.encoding().encode_str(s);
+        if self.eb.insert(pos, &bytes).is_ok() {
+            self.cursor = pos + bytes.len() as u64;
             self.anchor = None;
             self.invalidate_search();
         }
@@ -589,7 +591,7 @@ impl Tab {
         let len = (en - st) as usize;
         let mut buf = vec![0u8; len];
         self.eb.read(st, &mut buf).ok()?;
-        let text = String::from_utf8_lossy(&buf).into_owned();
+        let text = self.eb.encoding().decode_str(&buf);
         if !clipboard_set(&text) {
             return None;
         }
@@ -601,7 +603,7 @@ impl Tab {
         let len = (en - st) as usize;
         let mut buf = vec![0u8; len];
         self.eb.read(st, &mut buf).ok()?;
-        let text = String::from_utf8_lossy(&buf).into_owned();
+        let text = self.eb.encoding().decode_str(&buf);
         if !clipboard_set(&text) {
             return None;
         }
@@ -628,14 +630,16 @@ impl Tab {
             if self.eb.read(st, &mut buf).is_err() {
                 return;
             }
-            let text = String::from_utf8_lossy(&buf).into_owned();
+            let enc = self.eb.encoding();
+            let text = enc.decode_str(&buf);
             let transformed = match mode {
                 CaseMode::Upper => text.to_uppercase(),
                 CaseMode::Lower => text.to_lowercase(),
                 CaseMode::Title => title_case(&text),
             };
-            let _ = self.eb.replace(st, en - st, transformed.as_bytes());
-            self.cursor = st + transformed.len() as u64;
+            let bytes = enc.encode_str(&transformed);
+            let _ = self.eb.replace(st, en - st, &bytes);
+            self.cursor = st + bytes.len() as u64;
             self.anchor = None;
             self.invalidate_search();
         }
@@ -958,10 +962,14 @@ impl App {
         if let Some(job) = &tab.search.job {
             job.cancel();
         }
-        let query = SearchQuery::new(
-            tab.search.input.as_bytes().to_vec(),
-            tab.search.case_sensitive,
-        );
+        // 查找词按文件编码转换（GBK 文件 → GBK 字节）
+        let gbk = tab.eb.encoding().is_gbk();
+        let needle = tab.eb.encoding().encode_str(&tab.search.input);
+        let query = if gbk {
+            SearchQuery::new_gbk(needle, tab.search.case_sensitive)
+        } else {
+            SearchQuery::new(needle, tab.search.case_sensitive)
+        };
         let Some(base) = tab.eb.base_arc() else { return };
         match SearchJob::start(base, tab.eb.index_arc(), query, GUI_MAX_HITS, 0) {
             Ok(job) => {
@@ -1022,11 +1030,20 @@ impl App {
         let sel = tab.search.selected;
         let Some(h) = tab.search.hits.get(sel).cloned() else { return };
         // 防御：命中处内容应与查找词一致（结果过期时放弃本次替换并重扫）
-        let needle = tab.search.input.as_bytes().to_vec();
+        let enc = tab.eb.encoding();
+        let needle = enc.encode_str(&tab.search.input);
+        let repl_bytes = enc.encode_str(&repl);
+        let gbk = enc.is_gbk();
         let mut cur = vec![0u8; h.len as usize];
         let matched = tab.eb.read(h.offset, &mut cur).is_ok()
-            && if tab.search.case_sensitive {
-                cur == needle
+            && if tab.search.case_sensitive || gbk {
+                // GBK 非大小写敏感场景：命中来自 GBK 感知折叠的搜索，
+                // 这里用折叠后比较保持一致
+                let mut a = cur.clone();
+                let mut b = needle.clone();
+                hieditor_core::storage::encoding::fold_ascii(&mut a, gbk);
+                hieditor_core::storage::encoding::fold_ascii(&mut b, gbk);
+                a == b
             } else {
                 cur.eq_ignore_ascii_case(&needle)
             };
@@ -1036,12 +1053,16 @@ impl App {
             self.start_search();
             return;
         }
-        if tab.eb.replace(h.offset, u64::from(h.len), repl.as_bytes()).is_err() {
+        if tab
+            .eb
+            .replace(h.offset, u64::from(h.len), &repl_bytes)
+            .is_err()
+        {
             return;
         }
         // 增量修正命中表：移除已替换项，其后命中偏移平移。
         // 不整文件重扫——连续点"替换"时无需等待 GB 级扫描。
-        let delta = repl.len() as i64 - h.len as i64;
+        let delta = repl_bytes.len() as i64 - h.len as i64;
         {
             let hits = Arc::make_mut(&mut tab.search.hits);
             hits.remove(sel);
@@ -1051,7 +1072,7 @@ impl App {
             // selected 停在原位 = 原命中的下一条，连续替换直接按"替换"即可
             tab.search.selected = if hits.is_empty() { 0 } else { sel.min(hits.len() - 1) };
         }
-        tab.cursor = h.offset + repl.len() as u64;
+        tab.cursor = h.offset + repl_bytes.len() as u64;
         tab.anchor = None;
         tab.scroll_to_cursor();
         self.status = tr(lang, "status.replaced1").into();
@@ -1073,8 +1094,15 @@ impl App {
             self.status = tr(lang, "status.wordall").into();
             return;
         }
-        let needle = tab.search.input.as_bytes().to_vec();
-        let cnt = tab.eb.replace_all(&needle, repl.as_bytes(), !tab.search.case_sensitive);
+        let enc = tab.eb.encoding();
+        let needle = enc.encode_str(&tab.search.input);
+        let repl_bytes = enc.encode_str(&repl);
+        let cnt = tab.eb.replace_all(
+            &needle,
+            &repl_bytes,
+            !tab.search.case_sensitive,
+            enc.is_gbk(),
+        );
         tab.invalidate_search();
         self.status = format!("{}: {cnt}", tr(lang, "status.replaced_all"));
     }
@@ -1265,10 +1293,24 @@ fn non_empty(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// pos 前一个字符边界（UTF-8 安全）。
+/// pos 前一个字符边界（UTF-8 / GBK 安全）。
 fn prev_boundary(eb: &EditableBuffer, mut pos: u64) -> u64 {
     if pos == 0 {
         return 0;
+    }
+    if eb.encoding().is_gbk() {
+        // GBK：pos-1 是次字节且 pos-2 是前导 → 双字节汉字，回退 2
+        let mut b1 = [0u8; 1];
+        let mut b2 = [0u8; 1];
+        if pos >= 2
+            && eb.read(pos - 1, &mut b1).is_ok()
+            && hieditor_core::storage::encoding::is_gbk_trail(b1[0])
+            && eb.read(pos - 2, &mut b2).is_ok()
+            && hieditor_core::storage::encoding::is_gbk_lead(b2[0])
+        {
+            return pos - 2;
+        }
+        return pos - 1;
     }
     pos -= 1;
     let mut buf = [0u8; 1];
@@ -1283,11 +1325,21 @@ fn prev_boundary(eb: &EditableBuffer, mut pos: u64) -> u64 {
     pos
 }
 
-/// pos 后一个字符边界（UTF-8 安全）。
+/// pos 后一个字符边界（UTF-8 / GBK 安全）。
 fn next_boundary(eb: &EditableBuffer, mut pos: u64) -> u64 {
     let vlen = eb.len();
     if pos >= vlen {
         return vlen;
+    }
+    if eb.encoding().is_gbk() {
+        let mut b = [0u8; 1];
+        if eb.read(pos, &mut b).is_ok()
+            && hieditor_core::storage::encoding::is_gbk_lead(b[0])
+            && pos + 1 < vlen
+        {
+            return pos + 2;
+        }
+        return pos + 1;
     }
     pos += 1;
     let mut buf = [0u8; 1];
@@ -1345,7 +1397,50 @@ fn clamp_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// 双击选词：包含 pos 的连续非空白字符段（遇空白结束，UTF-8 安全）。
+/// 文件字节偏移（行内相对）→ 解码文本字节偏移。
+/// UTF-8 系恒等；GBK 按字符逐个累加编码长度（渲染层定位统一走此映射）。
+fn file_rel_to_dec(
+    enc: hieditor_core::storage::Encoding,
+    text: &str,
+    off: usize,
+) -> usize {
+    if enc.is_utf8_family() {
+        return off.min(text.len());
+    }
+    let mut dec = 0usize;
+    let mut gb = 0usize;
+    for c in text.chars() {
+        if gb >= off {
+            break;
+        }
+        gb += enc.char_len(c);
+        dec += c.len_utf8();
+    }
+    dec
+}
+
+/// 解码文本字节偏移 → 文件字节偏移（GBK 行做逐字映射，UTF-8 系恒等）。
+fn dec_rel_to_file(
+    enc: hieditor_core::storage::Encoding,
+    text: &str,
+    off: usize,
+) -> usize {
+    if enc.is_utf8_family() {
+        return off.min(text.len());
+    }
+    let mut dec = 0usize;
+    let mut gb = 0usize;
+    for c in text.chars() {
+        if dec + c.len_utf8() > off {
+            break;
+        }
+        dec += c.len_utf8();
+        gb += enc.char_len(c);
+    }
+    gb
+}
+
+/// 双击选词：包含 pos 的连续非空白字符段（遇空白结束，UTF-8 / GBK 安全）。
 fn word_range_at(eb: &EditableBuffer, pos: u64) -> (u64, u64) {
     let line = eb.line_of_offset(pos);
     let (s, e) = eb.line_bounds(line);
@@ -1362,10 +1457,39 @@ fn word_range_at(eb: &EditableBuffer, pos: u64) -> (u64, u64) {
             break;
         }
     }
+    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c);
+    if eb.encoding().is_gbk() {
+        // GBK：正向扫描收集字符起点（次字节可与 ASCII 重叠，必须从行首走），
+        // 空白只可能出现在单字节字符上（GBK 汉字首字节 ≥ 0x81）
+        let bytes: &[u8] = v;
+        let rel = ((pos - s) as usize).min(bytes.len());
+        let mut starts: Vec<usize> = Vec::with_capacity(bytes.len() + 1);
+        let mut i = 0usize;
+        while i < bytes.len() {
+            starts.push(i);
+            i += if bytes[i] < 0x80 { 1 } else { 2 };
+        }
+        let n_chars = starts.len();
+        if n_chars == 0 {
+            return (s, s);
+        }
+        let idx = starts
+            .partition_point(|&st| st <= rel)
+            .saturating_sub(1)
+            .min(n_chars - 1);
+        let mut lo = idx;
+        while lo > 0 && !is_ws(bytes[starts[lo - 1]]) {
+            lo -= 1;
+        }
+        let mut hi = idx;
+        while hi < n_chars && !is_ws(bytes[starts[hi]]) {
+            hi += 1;
+        }
+        return (s + starts[lo] as u64, s + starts[hi] as u64);
+    }
     let text = String::from_utf8_lossy(v);
     let bytes = text.as_bytes();
     let rel = ((pos - s) as usize).min(bytes.len());
-    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c);
     let mut a = rel;
     while a > 0 && !is_ws(bytes[a - 1]) {
         a -= 1;
@@ -1433,7 +1557,7 @@ fn read_line_text(
             break;
         }
     }
-    (s, e, String::from_utf8_lossy(v).into_owned())
+    (s, e, eb.encoding().decode_str(v))
 }
 
 /// 换行模式下某逻辑行的视觉行数（带缓存）。
@@ -1544,9 +1668,14 @@ fn cursor_at_pointer_flat(
     let galley = ui.fonts(|f| f.layout_no_wrap(text.clone(), font.clone(), theme_ui::TEXT_MEASURE));
     let sp = egui::vec2(pos.x - text_left + h_scroll, line_height * 0.5);
     let cur = galley.cursor_from_pos(sp);
-    let char_idx = cur.index.min(text.chars().count());
-    let byte: usize = text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
-    s + byte as u64
+    let enc = eb.encoding();
+    if enc.is_utf8_family() {
+        let char_idx = cur.index.min(text.chars().count());
+        let byte: usize = text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+        s + byte as u64
+    } else {
+        s + dec_rel_to_file(enc, &text, cur.index.min(text.len())) as u64
+    }
 }
 
 /// 换行模式点击命中。
@@ -1594,9 +1723,14 @@ fn cursor_at_pointer_wrap(
     let galley = ui.fonts(|f| f.layout(text.clone(), font.clone(), theme_ui::TEXT_MEASURE, text_w));
     let sp = egui::vec2(pos.x - text_left, rem as f32 * line_height + line_height * 0.5);
     let cur = galley.cursor_from_pos(sp);
-    let char_idx = cur.index.min(text.chars().count());
-    let byte: usize = text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
-    s + byte as u64
+    let enc = eb.encoding();
+    if enc.is_utf8_family() {
+        let char_idx = cur.index.min(text.chars().count());
+        let byte: usize = text.chars().take(char_idx).map(|c| c.len_utf8()).sum();
+        s + byte as u64
+    } else {
+        s + dec_rel_to_file(enc, &text, cur.index.min(text.len())) as u64
+    }
 }
 
 // 最近文件持久化
@@ -2414,8 +2548,8 @@ impl eframe::App for App {
                                        text: egui::Color32| {
                                 wd.bg_fill = bg;
                                 wd.weak_bg_fill = bg;
-                                wd.bg_stroke = egui::Stroke::new(1.0, border);
-                                wd.fg_stroke = egui::Stroke::new(1.0, text);
+                                wd.bg_stroke = egui::Stroke::new(1.0_f32, border);
+                                wd.fg_stroke = egui::Stroke::new(1.0_f32, text);
                             };
                             set(
                                 &mut w.inactive,
@@ -3555,13 +3689,32 @@ impl App {
                 th.gutter_fg,
             );
 
-            // 选区底色
+            // 选区底色（GBK 行：偏移先换算到解码文本坐标）
+            let enc = eb.encoding();
+            // 行内容末尾（文件字节，裁掉行尾 \r\n）。
+            // 基于本行原始行界 e_raw 做字节读——不能走索引路径：
+            // 大文件首屏渲染时索引尚未就绪（占位索引会越界崩溃）
+            let content_end_file = {
+                let mut end = e_raw;
+                let mut nb = [0u8; 1];
+                if end > s && eb.read(end - 1, &mut nb).is_ok() && nb[0] == b'\n' {
+                    end -= 1;
+                    if end > s && eb.read(end - 1, &mut nb).is_ok() && nb[0] == b'\r' {
+                        end -= 1;
+                    }
+                }
+                end
+            };
             if let Some((ss, se)) = sel {
-                let s_end = s + text_bytes as u64;
+                let s_end = content_end_file;
                 let a = ss.max(s).min(s_end);
                 let b = se.max(s).min(s_end);
                 if a < b {
-                    for (r, xf, xt) in span_rows(&text, (a - s) as usize, (b - s) as usize) {
+                    for (r, xf, xt) in span_rows(
+                        &text,
+                        file_rel_to_dec(enc, &text, (a - s) as usize),
+                        file_rel_to_dec(enc, &text, (b - s) as usize),
+                    ) {
                         text_painter.rect_filled(
                             egui::Rect::from_min_size(
                                 egui::Pos2::new(text_left + xf - h_scroll, y + r as f32 * line_height),
@@ -3577,14 +3730,18 @@ impl App {
             // 搜索命中底色
             let lo = hits.partition_point(|h| h.offset < s);
             for h in &hits[lo.min(hits.len())..] {
-                if h.offset >= s + text_bytes as u64 {
+                if h.offset >= content_end_file {
                     break;
                 }
-                let b = (h.offset + h.len as u64).min(s + text_bytes as u64);
+                let b = (h.offset + h.len as u64).min(content_end_file);
                 if b <= h.offset {
                     continue;
                 }
-                for (r, xf, xt) in span_rows(&text, (h.offset - s) as usize, (b - s) as usize) {
+                for (r, xf, xt) in span_rows(
+                    &text,
+                    file_rel_to_dec(enc, &text, (h.offset - s) as usize),
+                    file_rel_to_dec(enc, &text, (b - s) as usize),
+                ) {
                     text_painter.rect_filled(
                         egui::Rect::from_min_size(
                             egui::Pos2::new(
@@ -3605,9 +3762,13 @@ impl App {
 
             // 整行文本；当前命中的文字段用主题的 selected_text 颜色（多 section 排版）
             let sel_span = selected_range.and_then(|(hs, he)| {
-                let line_end = s + text_bytes as u64;
-                (hs >= s && he > hs && he <= line_end)
-                    .then(|| ((hs - s) as usize, (he - s) as usize))
+                (hs >= s && he > hs && he <= content_end_file)
+                    .then(|| {
+                        (
+                            file_rel_to_dec(enc, &text, (hs - s) as usize),
+                            file_rel_to_dec(enc, &text, (he - s) as usize),
+                        )
+                    })
             });
             let galley = if let Some((a, b)) = sel_span {
                 let a = clamp_char_boundary(&text, a);
@@ -3668,7 +3829,11 @@ impl App {
 
             // 光标条 + IME 锚点
             if cursor_line_visible && cursor_line == line {
-                let rel = ((cursor - s) as usize).min(text_bytes);
+                let rel = file_rel_to_dec(
+                    enc,
+                    &text,
+                    ((cursor - s) as usize).min(text.len()),
+                );
                 let (r, x) = pos_in_line(&text, rel);
                 let cursor_rect = egui::Rect::from_min_size(
                     egui::Pos2::new(text_left + x - h_scroll, y + r as f32 * line_height),

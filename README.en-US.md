@@ -43,6 +43,9 @@ Full technical analysis and measurements: [docs/ARCHITECTURE.md](docs/ARCHITECTU
   (~0.3 ms per edit on a 5GB file); command-based undo/redo; Replace All is a single undo unit
 - **Automatic storage backend selection**: whole-read for small files (≤300MB), memory mapping
   for local large files, chunked reads for network/removable drives
+- **Full GBK/GB2312 support**: auto-detection, Chinese rendering, Chinese input/cursor/selection,
+  encoding-aware search & replace; saving preserves the original encoding — the byte-level
+  pipeline keeps the large-file architecture untouched
 
 ### GUI
 
@@ -190,8 +193,7 @@ multi-tab / find & replace / printing / custom fonts / themes / i18n
 
 ## ⚠️ Known limitations
 
-1. Editing/search fully support UTF-8/ASCII only; UTF-16/ANSI are detected but their edit
-   paths are not implemented yet
+1. UTF-16 is detected but its edit path is not implemented yet (GBK/GB2312 fully supported)
 2. First open on a cold (mechanical) drive is bounded by disk physics (~40MB/s) — the first
    screen still appears instantly while indexing completes in the background
 3. Cross-line and regex search not yet available

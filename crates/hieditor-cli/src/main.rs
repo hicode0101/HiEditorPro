@@ -293,7 +293,14 @@ fn cmd_search(path: &PathBuf, needle: &str, ignore_case: bool, show: usize, max:
         doc.index_ms
     );
 
-    let query = SearchQuery::new(needle.as_bytes().to_vec(), !ignore_case);
+    // 搜索词按文件编码转换（GBK 文件 → GBK 字节）
+    let gbk = doc.encoding.is_gbk();
+    let needle_bytes = doc.encoding.encode_str(needle);
+    let query = if gbk {
+        SearchQuery::new_gbk(needle_bytes, !ignore_case)
+    } else {
+        SearchQuery::new(needle_bytes, !ignore_case)
+    };
     let job = SearchJob::start(doc.base.clone(), index.clone(), query, max, threads)
         .with_context(|| "启动搜索失败")?;
     let mut last_print = Instant::now();

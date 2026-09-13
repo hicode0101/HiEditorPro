@@ -25,6 +25,8 @@ pub struct SearchHit {
 pub struct SearchQuery {
     pub needle: Vec<u8>,
     pub case_sensitive: bool,
+    /// GBK 文件：大小写折叠时跳过双字节序列的次字节（避免汉字误匹配）
+    pub gbk: bool,
 }
 
 impl SearchQuery {
@@ -32,6 +34,16 @@ impl SearchQuery {
         Self {
             needle: needle.into(),
             case_sensitive,
+            gbk: false,
+        }
+    }
+
+    /// GBK 编码文件的查询（needle 应为 GBK 字节）。
+    pub fn new_gbk(needle: impl Into<Vec<u8>>, case_sensitive: bool) -> Self {
+        Self {
+            needle: needle.into(),
+            case_sensitive,
+            gbk: true,
         }
     }
 }
@@ -247,11 +259,14 @@ fn run_core(
     let file_len = base.len();
     let n = chunk_count(file_len, content_start, DEFAULT_CHUNK);
     let case_sensitive = query.case_sensitive;
-    // 大小写不敏感：needle 与块内容同步 ASCII 小写化（1:1 字节变换，偏移不变）
+    // 大小写不敏感：needle 与块内容同步 ASCII 小写化（1:1 字节变换，偏移不变）；
+    // GBK 文件跳过双字节序列的次字节，避免汉字次字节被误折叠造成误匹配
     let lowered = if case_sensitive {
         None
     } else {
-        Some(query.needle.to_ascii_lowercase())
+        let mut n = query.needle.clone();
+        hieditor_core::storage::encoding::fold_ascii(&mut n, query.gbk);
+        Some(n)
     };
     let effective: &[u8] = lowered.as_deref().unwrap_or(&query.needle);
     let needle_len = effective.len() as u64;
@@ -277,7 +292,7 @@ fn run_core(
             Vec::new()
         } else {
             let mut h = src.to_vec();
-            h.make_ascii_lowercase();
+            hieditor_core::storage::encoding::fold_ascii(&mut h, query.gbk);
             h
         };
         let hay: &[u8] = if case_sensitive { src } else { &lower_copy };

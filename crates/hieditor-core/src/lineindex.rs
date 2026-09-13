@@ -256,6 +256,10 @@ impl LineIndex {
 
     /// 第 `line` 行的起始字节偏移。O(块大小)。
     pub fn start_of_line(&self, line: u64) -> u64 {
+        // 占位索引（blocks 为空，首屏先行阶段）→ 恒返回 0，防御误用
+        if self.blocks.is_empty() {
+            return 0;
+        }
         let n = self.line_count();
         let line = line.min(n.saturating_sub(1));
         let (b, local) = self.block_for_line(line);
