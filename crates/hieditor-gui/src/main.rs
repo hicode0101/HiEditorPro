@@ -318,6 +318,7 @@ fn create_desktop_shortcut() -> bool {
 
 /// 内置字体候选（显示名, 字体文件）。字体下拉以此为基底，
 /// 启动时再追加 exe 旁 `fonts/` 目录识别出的用户字体（见 fonts.rs）。
+/// ("微软雅黑", "C:\\Windows\\Fonts\\msyh.ttc"),
 const BUILTIN_FONT_CHOICES: &[(&str, &str)] = &[
     ("Consolas", "C:\\Windows\\Fonts\\consola.ttf"),
     ("黑体", "C:\\Windows\\Fonts\\simhei.ttf"),
@@ -3031,8 +3032,18 @@ impl eframe::App for App {
                     // 最新打开的 tab 仍在读取头部
                 }
                 let Some(mut tab) = self.eb_take_active() else {
-                    ui.heading("HiEditor Pro");
-                    ui.label(tr(lang, "empty.hint1"));
+                    // 空状态提示：加大左、上内边距，避免文字贴着窗口边缘
+                    egui::Frame::default()
+                        .inner_margin(egui::Margin {
+                            left: 24,
+                            right: 24,
+                            top: 16,
+                            bottom: 16,
+                        })
+                        .show(ui, |ui| {
+                            ui.heading("HiEditor Pro");
+                            ui.label(tr(lang, "empty.hint1"));
+                        });
                     return;
                 };
                 self.render_editor(ui, &mut tab);
