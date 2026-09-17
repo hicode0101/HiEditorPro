@@ -1,8 +1,9 @@
-# HiEditor Pro 自动编译打包（对齐 package.bat 流程）
-# - push 到 main / 手动触发：编译并上传构建产物（Artifacts）
-# - push v* 标签（如 v1.0.0）：额外创建 GitHub Release 并附上 zip
+# HiEditor Pro 自动编译打包发布
+# - push v* 标签（如 v1.0.0）：以 tag 为版本号源头——自动把根 Cargo.toml 的 version
+#   同步为 tag 版本（程序"关于"里的版本号取自编译期 CARGO_PKG_VERSION，随之一致），
+#   打包 HiEditorPro-v{tag版本}.zip 并自动发布到 GitHub Release
+# - 手动触发（workflow_dispatch）：按 Cargo.toml 版本编译打包，上传 Artifacts
 # 产物：HiEditorPro-v{版本}.zip，内含 hieditor-pro.exe（由 hieditor-gui.exe 改名）
-# 版本号自动从根 Cargo.toml 读取，无需在此维护
 
 name: Package
 
@@ -22,24 +23,45 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
+      # 版本号以 tag 为准：有 v* tag 用 tag 版本，手动触发无 tag 时回落到 Cargo.toml
+      - name: 确定版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $cargoVer = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line -replace '[^0-9.]', ''
+          $tag = ''
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $tag = $env:GITHUB_REF_NAME -replace '^v', '' }
+          if ($tag) {
+            "tag=$tag" >> $env:GITHUB_OUTPUT
+            "version=$tag" >> $env:GITHUB_OUTPUT
+            "版本来源: tag v$tag"
+          } else {
+            "tag=" >> $env:GITHUB_OUTPUT
+            "version=$cargoVer" >> $env:GITHUB_OUTPUT
+            "版本来源: Cargo.toml v$cargoVer"
+          }
+
+      # 仅 tag 触发：把根 Cargo.toml 的 workspace version 改成 tag 版本，
+      # 使代码内版本号与 tag 一致（成员 crate 均为 version.workspace = true，无需改动；
+      # Cargo.lock 的本地包版本会在 cargo build 时自动更新）
+      - name: 同步版本号到代码
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ steps.ver.outputs.tag }}'
+          (Get-Content Cargo.toml -Raw) -replace '(?m)^version\s*=\s*"[^"]*"', ('version = "' + $tag + '"') | Set-Content Cargo.toml -NoNewline
+          Select-String -Path Cargo.toml -Pattern '^version' | ForEach-Object { "已同步: $($_.Line.Trim())" }
+
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
       - name: 缓存 Cargo 依赖
         uses: Swatinem/rust-cache@v2
 
-      # package.bat 前提步骤：编译 release（只编译 GUI 及其依赖，速度更快）
+      # 只编译 GUI 及其依赖（产物只需要 GUI 的 exe），速度更快
       - name: 编译 release
         run: cargo build --release -p hieditor-gui
-
-      # 从根 Cargo.toml 提取版本号（与 release.bat/package.bat 的提取逻辑一致）
-      - name: 读取版本号
-        id: ver
-        shell: pwsh
-        run: |
-          $v = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line -replace '[^0-9.]', ''
-          "version=$v" >> $env:GITHUB_OUTPUT
-          "使用版本: $v"
 
       # 复刻 package.bat：准备暂存目录 → hieditor-gui.exe 改名 hieditor-pro.exe → 压缩 zip
       - name: 打包
@@ -61,9 +83,10 @@ jobs:
           path: dist/HiEditorPro-v*.zip
           if-no-files-found: error
 
-      # 仅 v* 标签触发：创建 GitHub Release 并附上 zip
+      # 仅 v* 标签触发：自动创建 Release 并附上 zip（generate_release_notes 自动生成更新说明）
       - name: 发布 Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/HiEditorPro-v*.zip
+          generate_release_notes: true
