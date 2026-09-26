@@ -2553,9 +2553,12 @@ impl eframe::App for App {
                     }
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let _ = ui.button("⚙"); // 预留：设置入口
-                    if ui.button("🔔").clicked() {
-                        self.status = "HiEditor Pro v0.3".into();
+                    if ui
+                        .button("⚙")
+                        .on_hover_text(tr(lang, "file.settings"))
+                        .clicked()
+                    {
+                        self.show_settings = true;
                     }
                 });
             });
