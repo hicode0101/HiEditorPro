@@ -11,6 +11,10 @@
 ![Tests](https://img.shields.io/badge/tests-41%20passing-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+
+[![Release](https://img.shields.io/badge/%F0%9F%9B%A0%EF%B8%8F_Get_the_Tool-Binary_Download-F0883E?logo=github&logoColor=white)](https://github.com/hicode0101/HiEditorPro-Release/releases)
+
+
 | Dark mode | Light mode |
 |---|---|
 | ![Dark theme](docs/ScreenShot/HiEditorPro-1.png) | ![Light theme](docs/ScreenShot/HiEditorPro-2.png) |
