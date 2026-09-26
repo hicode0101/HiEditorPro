@@ -16,11 +16,11 @@ use hieditor_core::lineindex::{LineIndex, LineIndexBuilder};
 use hieditor_core::util::fmt_size;
 use hieditor_search::{SearchHit, SearchJob, SearchQuery};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 // ---------- 主题颜色 ----------
 // 所有界面颜色集中在 theme.rs（唯一改色入口），本文件不再出现具体色值
@@ -234,7 +234,16 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "status.comingsoon") => if zh { "即将支持" } else { "Coming soon" },
         (_, "tab.openfolder") => if zh { "打开所在文件夹" } else { "Open Containing Folder" },
         (_, "tab.copydir") => if zh { "复制当前目录路径" } else { "Copy Folder Path" },
-        (_, "tab.copyfile") => if zh { "复制当前文件路径" } else { "Copy File Path" },        (_, "search.menufr") => if zh { "查找并替换（Ctrl+H）" } else { "Find & Replace (Ctrl+H)" },        (_, "edit.upper") => if zh { "转大写" } else { "UPPERCASE" },        (_, "edit.lower") => if zh { "转小写" } else { "lowercase" },        (_, "edit.title") => if zh { "首字母大写其余小写" } else { "Title Case" },        (_, "status.opened") => if zh { "已打开" } else { "Opened" },        (_, "status.replaced_all") => if zh { "全部替换完成（Ctrl+Z 可整批撤销）" } else { "Replace all done (Ctrl+Z to undo)" },        (_, "status.indexed") => if zh { "已索引" } else { "Indexed" },        (_, "status.editwhen") => if zh { "索引完成后可编辑/搜索" } else { "edit & search unlock when done" },        (_, "about.desc") => if zh { "Win平台大文本快速编辑工具，秒开GB级以上文件" } else { "Windows platform large text editing tool, opens files larger than GB in seconds." },        _ => "",
+        (_, "tab.copyfile") => if zh { "复制当前文件路径" } else { "Copy File Path" },        (_, "search.menufr") => if zh { "查找并替换（Ctrl+H）" } else { "Find & Replace (Ctrl+H)" },        (_, "edit.upper") => if zh { "转大写" } else { "UPPERCASE" },        (_, "edit.lower") => if zh { "转小写" } else { "lowercase" },        (_, "edit.title") => if zh { "首字母大写其余小写" } else { "Title Case" },        (_, "status.opened") => if zh { "已打开" } else { "Opened" },        (_, "status.replaced_all") => if zh { "全部替换完成（Ctrl+Z 可整批撤销）" } else { "Replace all done (Ctrl+Z to undo)" },        (_, "status.indexed") => if zh { "已索引" } else { "Indexed" },        (_, "status.editwhen") => if zh { "索引完成后可编辑/搜索" } else { "edit & search unlock when done" },        (_, "about.desc") => if zh { "Win平台大文本快速编辑工具，秒开GB级以上文件" } else { "Windows platform large text editing tool, opens files larger than GB in seconds." },
+        (_, "edit.reload") => if zh { "重新加载文件" } else { "Reload File" },
+        (_, "reload.title") => if zh { "文件已变化" } else { "File Changed" },
+        (_, "reload.msg") => if zh { "文件 “{}” 已在磁盘上被修改，是否重新加载？" } else { "File “{}” has been modified on disk. Reload it?" },
+        (_, "reload.msg_manual") => if zh { "文件 “{}” 当前有未保存的修改，重新加载将恢复为磁盘上的内容。" } else { "File “{}” has unsaved changes; reloading will restore the on-disk content." },
+        (_, "reload.dirty") => if zh { "注意：当前有未保存的修改，重新加载后将丢失。" } else { "Note: there are unsaved changes; reloading will discard them." },
+        (_, "btn.ok") => if zh { "确定" } else { "OK" },
+        (_, "status.reloaded") => if zh { "已重新加载" } else { "Reloaded" },
+        (_, "reload.nofilesel") => if zh { "无标题文档尚未关联文件，无法重新加载" } else { "Untitled document has no file to reload" },
+        _ => "",
     }
 }
 
@@ -429,6 +438,10 @@ struct Tab {
     load_total: u64,
     search: SearchUi,
     replace_input: String,
+    /// 打开/保存/重新加载时记录的磁盘文件签名（mtime, size），用于检测外部修改
+    file_sig: Option<(SystemTime, u64)>,
+    /// 已检测到外部修改但尚未向用户提示（后台标签页待切换到时弹窗）
+    file_changed_pending: bool,
 }
 
 impl Tab {
@@ -453,6 +466,8 @@ impl Tab {
             load_total: 0,
             search: SearchUi::default(),
             replace_input: String::new(),
+            file_sig: None,
+            file_changed_pending: false,
         }
     }
 
@@ -476,6 +491,11 @@ impl Tab {
 
     fn is_loading(&self) -> bool {
         !self.eb.has_index()
+    }
+
+    /// 保存/重新加载成功后同步磁盘签名，避免把自己的写入误判为外部修改
+    fn refresh_file_sig(&mut self) {
+        self.file_sig = file_signature(self.eb.path());
     }
 
     fn sel_range(&self) -> Option<(u64, u64)> {
@@ -728,6 +748,12 @@ struct App {
     recent_files: Vec<PathBuf>,
     confirm_close: Option<usize>,
     status: String,
+    /// 文件变化弹窗：待用户决策的（标签页 id, 是否外部修改）；模态，遮罩阻断其余交互
+    reload_confirm: Option<(u64, bool)>,
+    /// 待执行的重新加载（右键菜单/弹窗确定时暂存，update 末尾标签页放回后处理）
+    reload_requested: Option<u64>,
+    /// 上次文件变化轮询时刻（1s 节流，避免每帧 stat）
+    last_poll: Instant,
 }
 
 impl App {
@@ -767,6 +793,9 @@ impl App {
             recent_files: load_recent_files(),
             confirm_close: None,
             status: tr(lang, "empty.hint1").into(),
+            reload_confirm: None,
+            reload_requested: None,
+            last_poll: Instant::now(),
         };
         if let Some(p) = std::env::args().nth(1) {
             app.path_input = p.clone();
@@ -830,10 +859,12 @@ impl App {
     fn save_all_dirty(&mut self) -> usize {
         let mut saved = 0;
         for t in self.tabs.iter_mut() {
-            if t.eb.is_dirty() && !t.eb.path().as_os_str().is_empty() {
-                if t.eb.save().is_ok() {
-                    saved += 1;
-                }
+            if t.eb.is_dirty()
+                && !t.eb.path().as_os_str().is_empty()
+                && t.eb.save().is_ok()
+            {
+                t.refresh_file_sig();
+                saved += 1;
             }
         }
         saved
@@ -887,59 +918,32 @@ impl App {
         self.open_rx = Some(rx);
         self.open_error = None;
         self.status = format!("{} {}", tr(lang, "status.reading"), path.display());
-        std::thread::spawn(move || {
-            let eb = match EditableBuffer::open_head(&path, &OpenOptions::default()) {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = tx.send(OpenMsg::Error { tab_id: id, msg: e.to_string() });
-                    return;
-                }
-            };
-            let bom = eb.encoding().bom_len();
-            let vlen = eb.len().saturating_sub(bom);
-            let base = eb.base_arc();
-            let _ = tx.send(OpenMsg::Head { tab_id: id, eb, total: vlen });
-            let Some(base) = base else { return };
+        spawn_load_thread(path, id, cancel, tx);
+    }
 
-            // 顺序读盘 + 渐进建索引（机械盘最优 I/O 模式）
-            let mut builder = LineIndexBuilder::new(bom);
-            let win = 16 << 20;
-            let mut buf = vec![0u8; win as usize];
-            let mut covered = 0u64;
-            let mut win_starts: Vec<u64> = Vec::new();
-            let mut pending_gui: Vec<u64> = Vec::new();
-            let mut next_report = HEAD_SCAN;
-            while covered < vlen {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let wsize = if covered == 0 { HEAD_SCAN } else { win };
-                let n = wsize.min(vlen - covered) as usize;
-                if let Err(e) = base.read_range(bom + covered, n, &mut buf[..n]) {
-                    let _ = tx.send(OpenMsg::Error { tab_id: id, msg: e.to_string() });
-                    return;
-                }
-                for rel in memchr::memchr_iter(b'\n', &buf[..n]) {
-                    let start = covered + rel as u64 + 1;
-                    if start < vlen {
-                        win_starts.push(start);
-                    }
-                }
-                covered += n as u64;
-                builder.push_line_starts(&win_starts);
-                pending_gui.append(&mut win_starts);
-                if covered >= next_report || covered == vlen {
-                    let _ = tx.send(OpenMsg::Coverage {
-                        tab_id: id,
-                        starts: Arc::new(std::mem::take(&mut pending_gui)),
-                        covered_lines: builder.covered_lines(),
-                        covered_bytes: covered,
-                    });
-                    next_report = covered + (64 << 20).max(covered / 10);
-                }
-            }
-            let _ = tx.send(OpenMsg::Index { tab_id: id, idx: Box::new(builder.finish(vlen)) });
-        });
+    /// 重新加载标签页对应的文件（后台管线复用；Head 消息按 tab_id 命中既有标签时整体替换）。
+    fn request_reload(&mut self, tab_id: u64) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let path = self.tabs[idx].eb.path().to_path_buf();
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        let lang = self.lang;
+        // 终止仍在进行的加载
+        for c in self.load_cancels.values() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.load_cancels.clear();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.load_cancels.insert(tab_id, Arc::clone(&cancel));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.open_rx = Some(rx);
+        self.open_error = None;
+        self.status = format!("{} {}", tr(lang, "status.reading"), path.display());
+        spawn_load_thread(path, tab_id, cancel, tx);
     }
 
     fn start_search(&mut self) {
@@ -1292,6 +1296,69 @@ impl App {
 
 fn non_empty(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
+}
+
+/// 磁盘文件当前签名（修改时间, 字节数）；文件不存在或不可读时为 None。
+fn file_signature(path: &Path) -> Option<(SystemTime, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.modified().ok()?, md.len()))
+}
+
+/// 后台加载线程：open_head 先发首屏，随后顺序读盘 + 渐进建索引（机械盘最优 I/O 模式）。
+/// 打开与重新加载共用；消息按 tab_id 路由，由 update 中的轮询分发。
+fn spawn_load_thread(path: PathBuf, tab_id: u64, cancel: Arc<AtomicBool>, tx: Sender<OpenMsg>) {
+    std::thread::spawn(move || {
+        let eb = match EditableBuffer::open_head(&path, &OpenOptions::default()) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = tx.send(OpenMsg::Error { tab_id, msg: e.to_string() });
+                return;
+            }
+        };
+        let bom = eb.encoding().bom_len();
+        let vlen = eb.len().saturating_sub(bom);
+        let base = eb.base_arc();
+        let _ = tx.send(OpenMsg::Head { tab_id, eb, total: vlen });
+        let Some(base) = base else { return };
+
+        let mut builder = LineIndexBuilder::new(bom);
+        let win = 16 << 20;
+        let mut buf = vec![0u8; win as usize];
+        let mut covered = 0u64;
+        let mut win_starts: Vec<u64> = Vec::new();
+        let mut pending_gui: Vec<u64> = Vec::new();
+        let mut next_report = HEAD_SCAN;
+        while covered < vlen {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let wsize = if covered == 0 { HEAD_SCAN } else { win };
+            let n = wsize.min(vlen - covered) as usize;
+            if let Err(e) = base.read_range(bom + covered, n, &mut buf[..n]) {
+                let _ = tx.send(OpenMsg::Error { tab_id, msg: e.to_string() });
+                return;
+            }
+            for rel in memchr::memchr_iter(b'\n', &buf[..n]) {
+                let start = covered + rel as u64 + 1;
+                if start < vlen {
+                    win_starts.push(start);
+                }
+            }
+            covered += n as u64;
+            builder.push_line_starts(&win_starts);
+            pending_gui.append(&mut win_starts);
+            if covered >= next_report || covered == vlen {
+                let _ = tx.send(OpenMsg::Coverage {
+                    tab_id,
+                    starts: Arc::new(std::mem::take(&mut pending_gui)),
+                    covered_lines: builder.covered_lines(),
+                    covered_bytes: covered,
+                });
+                next_report = covered + (64 << 20).max(covered / 10);
+            }
+        }
+        let _ = tx.send(OpenMsg::Index { tab_id, idx: Box::new(builder.finish(vlen)) });
+    });
 }
 
 /// pos 前一个字符边界（UTF-8 / GBK 安全）。
@@ -1853,10 +1920,53 @@ impl eframe::App for App {
         }
         let th = editor_theme(self.theme_mode == ThemeMode::Dark);
 
-        // ---- 全局快捷键（不依赖编辑区焦点）----
+        // ---- 文件变化检测（1s 节流轮询磁盘签名；有已打开文件时低频唤醒空闲窗口）----
+        if self.last_poll.elapsed() >= Duration::from_secs(1) {
+            self.last_poll = Instant::now();
+            for t in self.tabs.iter_mut() {
+                if t.eb.path().as_os_str().is_empty() {
+                    continue;
+                }
+                match (t.file_sig, file_signature(t.eb.path())) {
+                    (None, cur) => t.file_sig = cur, // 基线补录
+                    (Some(old), Some(cur)) if old != cur => t.file_changed_pending = true,
+                    _ => {}
+                }
+            }
+            // 正在观看/编辑（活动标签页）出现未提示的变化 → 弹模态窗；
+            // 后台标签页先挂起，待切换到该标签页时再弹
+            if self.reload_confirm.is_none() {
+                let active_id = self
+                    .tabs
+                    .get(self.active)
+                    .filter(|t| t.file_changed_pending)
+                    .map(|t| t.id);
+                if let Some(id) = active_id {
+                    if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                        t.file_changed_pending = false;
+                    }
+                    self.reload_confirm = Some((id, true));
+                    // 收回可能停留在查找框等的键盘焦点，弹窗期间按键不再泄漏到界面
+                    ctx.memory_mut(|mem| {
+                        if let Some(focus_id) = mem.focused() {
+                            mem.surrender_focus(focus_id);
+                        }
+                    });
+                }
+            }
+        }
+        if self
+            .tabs
+            .iter()
+            .any(|t| !t.eb.path().as_os_str().is_empty())
+        {
+            ctx.request_repaint_after(Duration::from_millis(1000));
+        }
+
+        // ---- 全局快捷键（不依赖编辑区焦点；弹窗期间全部禁用）----
         // F3 / Shift+F3：搜索下一个/上一个；Ctrl+加号/减号/0：缩放；
         // Ctrl+F / Ctrl+H：查找/查找替换（查找面板开着时也可再按）
-        {
+        if self.reload_confirm.is_none() {
             let mods = ctx.input(|i| i.modifiers);
             if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
                 if mods.shift {
@@ -1910,10 +2020,23 @@ impl eframe::App for App {
                         let size = fmt_size(eb.len());
                         let mut t = Tab::new(tab_id, eb);
                         t.load_total = total;
-                        self.tabs.push(t);
-                        self.active = self.tabs.len() - 1;
-                        self.status =
-                            format!("{} {title}（{backend} · {size}）· {}", tr(lang, "status.opened"), tr(lang, "status.indexing"));
+                        t.refresh_file_sig();
+                        if let Some(pos) = self.tabs.iter().position(|old| old.id == tab_id) {
+                            // 重新加载：整体替换既有标签页（光标/选区/滚动/搜索随之复位）
+                            if let Some(job) = self.tabs[pos].search.job.take() {
+                                job.cancel();
+                            }
+                            self.tabs[pos] = t;
+                            if pos == self.active {
+                                self.status =
+                                    format!("{} {title}（{backend} · {size}）· {}", tr(lang, "status.reloaded"), tr(lang, "status.indexing"));
+                            }
+                        } else {
+                            self.tabs.push(t);
+                            self.active = self.tabs.len() - 1;
+                            self.status =
+                                format!("{} {title}（{backend} · {size}）· {}", tr(lang, "status.opened"), tr(lang, "status.indexing"));
+                        }
                     }
                     Ok(OpenMsg::Coverage { tab_id, starts, covered_lines, covered_bytes }) => {
                         if let Some(t) = self
@@ -2052,9 +2175,9 @@ impl eframe::App for App {
             self.status = Self::print_status_text(m, lang);
         }
 
-        // ---- 拖放文件 → 新标签页打开 ----
+        // ---- 拖放文件 → 新标签页打开（弹窗期间禁用）----
         let hovered = ctx.input(|i| i.raw.hovered_files.clone());
-        if !hovered.is_empty() {
+        if !hovered.is_empty() && self.reload_confirm.is_none() {
             let screen = ctx.screen_rect();
             let painter =
                 ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay")));
@@ -3225,6 +3348,69 @@ impl eframe::App for App {
                 self.confirm_close = None;
             }
         }
+
+        // ---- 文件已变化提示 / 手动重载确认（模态：遮罩阻断其余交互，必须点 确定/取消）----
+        if let Some((tab_id, external)) = self.reload_confirm {
+            if let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) {
+                let lang = self.lang;
+                let name = self.tabs[idx]
+                    .eb
+                    .path()
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| self.tabs[idx].eb.path().to_string_lossy().to_string());
+                let dirty = self.tabs[idx].eb.is_dirty();
+                let mut reload = false;
+                let mut cancel = false;
+                let modal = egui::Modal::new(egui::Id::new("reload_modal"))
+                    .frame(egui::Frame::popup(&ctx.style()).inner_margin(14.0));
+                modal.show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.strong(tr(lang, "reload.title"));
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(if external {
+                        trf(lang, "reload.msg", &[&name])
+                    } else {
+                        trf(lang, "reload.msg_manual", &[&name])
+                    });
+                    if dirty {
+                        ui.add_space(4.0);
+                        ui.colored_label(theme_ui::ERROR_TEXT, tr(lang, "reload.dirty"));
+                    }
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(tr(lang, "btn.ok")).clicked() {
+                            reload = true;
+                        }
+                        if ui.button(tr(lang, "confirm.cancel")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+                // 遮罩点击 / Esc 不关闭：必须点 确定 或 取消
+                if reload {
+                    self.reload_confirm = None;
+                    self.reload_requested = Some(tab_id);
+                } else if cancel {
+                    self.reload_confirm = None;
+                    // 外部修改被放弃：以当前磁盘状态为新基线，取消后不再重复提示（直至文件再次变化）
+                    if external {
+                        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            t.refresh_file_sig();
+                            t.file_changed_pending = false;
+                        }
+                    }
+                }
+            } else {
+                self.reload_confirm = None;
+            }
+        }
+
+        // 重新加载（右键菜单/弹窗确定时暂存，此处标签页已放回，统一处理）
+        if let Some(id) = self.reload_requested.take() {
+            self.request_reload(id);
+        }
     }
 }
 
@@ -3246,12 +3432,15 @@ impl Tab {
             return tr(lang, "status.untitlednosave").into();
         }
         match self.eb.save() {
-            Ok(()) => format!(
-                "{} {}（{}）",
-                tr(lang, "status.saved"),
-                self.eb.path().display(),
-                fmt_size(self.eb.len())
-            ),
+            Ok(()) => {
+                self.refresh_file_sig();
+                format!(
+                    "{} {}（{}）",
+                    tr(lang, "status.saved"),
+                    self.eb.path().display(),
+                    fmt_size(self.eb.len())
+                )
+            }
             Err(e) => format!("{}: {e}", tr(lang, "status.savefail")),
         }
     }
@@ -3594,11 +3783,25 @@ impl App {
                 {
                     tab.transform_selection(CaseMode::Title);
                 }
+                ui.separator();
+                // 重新加载文件：无未保存修改时直接执行；有未保存修改时经弹窗确认，避免误丢编辑
+                let has_path = !tab.eb.path().as_os_str().is_empty();
+                if ui
+                    .add_enabled(has_path, egui::Button::new(tr(lang, "edit.reload")))
+                    .on_disabled_hover_text(tr(lang, "reload.nofilesel"))
+                    .clicked()
+                {
+                    if tab.eb.is_dirty() {
+                        self.reload_confirm = Some((tab.id, false));
+                    } else {
+                        self.reload_requested = Some(tab.id);
+                    }
+                }
             });
         }
 
-        // ---- 键盘 ----
-        if self.editor_focused && index_ready {
+        // ---- 键盘（弹窗期间禁用，避免按键穿透修改缓冲）----
+        if self.editor_focused && index_ready && self.reload_confirm.is_none() {
             let events: Vec<egui::Event> = ui.input(|i| i.events.clone());
             for ev in events {
                 match ev {
