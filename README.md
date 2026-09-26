@@ -13,7 +13,7 @@ A GB-scale text editor for Windows — instant open, millisecond full-file searc
 ![测试](https://img.shields.io/badge/tests-41%20passing-brightgreen)
 ![协议](https://img.shields.io/badge/license-MIT-green)
 
-[![Release](https://img.shields.io/badge/%F0%9F%9B%A0%EF%B8%8F_%E8%8E%B7%E5%8F%96%E5%B7%A5%E5%85%B7-%E4%BA%8C%E8%BF%9B%E5%88%B6%E4%B8%8B%E8%BD%BD-F0883E?logo=github&logoColor=white)](https://github.com/hicode0101/HiEditorPro-Release/releases)
+[![Release](https://img.shields.io/badge/%F0%9F%9B%A0%EF%B8%8F_%E8%8E%B7%E5%8F%96%E5%B7%A5%E5%85%B7-%E4%BA%8C%E8%BF%9B%E5%88%B6%E4%B8%8B%E8%BD%BD-F0883E?logo=github&logoColor=white)](https://github.com/hicode0101/HiEditorPro/releases)
 
 
 | 深色模式 | 浅色模式 |
