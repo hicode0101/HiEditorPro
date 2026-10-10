@@ -5,6 +5,7 @@ members = [
     "crates/hieditor-search",
     "crates/hieditor-cli",
     "crates/hieditor-gui",
+    "crates/hieditor-menu",
     "crates/hieditor-bench",
 ]
 

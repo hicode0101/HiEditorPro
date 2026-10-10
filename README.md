@@ -105,17 +105,31 @@ GB 级文件毫秒级打开、全文件搜索秒级完成、编辑操作与文�
 git clone <repo-url>
 cd HiEditorPro
 cargo build --release
-# 产物：target/release/hieditor-gui.exe（GUI）与 hieditor-cli.exe（命令行）
+# 产物：target/release/hieditor-pro.exe（GUI）与 hieditor-cli.exe（命令行）
 ```
 
-或直接使用发布包 `dist/HiEditorPro-v*.zip`（含两个 exe + README，无安装器）。
+或直接使用发布包 `dist/HiEditorPro-v*.zip`（含两个 exe + 右键菜单安装脚本 + README，无安装器）。
 
 ## 🖥️ GUI 使用
 
 ```bash
-hieditor-gui test_5gb.log        # 命令行参数直接打开
-hieditor-gui                     # 空窗口，可拖入文件或 Ctrl+O 打开
+hieditor-pro test_5gb.log        # 命令行参数直接打开
+hieditor-pro                     # 空窗口，可拖入文件或 Ctrl+O 打开
 ```
+
+## 🖱️ 右键菜单集成
+
+解压发布包后运行 **`install.bat`**（免管理员、可重复执行），即可把
+「用 HiEditor Pro 打开」注册进资源管理器右键菜单：
+
+- **Windows 11**：新版右键菜单第一层直接可见（稀疏 MSIX 包 + IExplorerCommand
+  COM 组件；需系统已开启开发者模式，或以管理员导入自签证书后签名部署）
+- **Windows 10**：右键菜单第一层直接可见（HKCU 静态动词）
+- 多选文件一次打开：每个文件一个标签页；卸载运行 `uninstall.bat`
+- 也可以在程序内操作：**设置 → 注册右键菜单打开**，一键完成上述注册
+- 排查日志：`%TEMP%\hieditor_menu.log`（COM 组件）、`%TEMP%\hieditor_pro.log`（主程序参数）
+
+实现细节与踩坑清单见 [CONTEXT-MENU-CHECKLIST.md](CONTEXT-MENU-CHECKLIST.md)。
 
 常用快捷键：
 

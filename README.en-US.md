@@ -113,17 +113,32 @@ Full technical analysis and measurements: [docs/ARCHITECTURE.md](docs/ARCHITECTU
 git clone <repo-url>
 cd HiEditorPro
 cargo build --release
-# Outputs: target/release/hieditor-gui.exe (GUI) and hieditor-cli.exe (CLI)
+# Outputs: target/release/hieditor-pro.exe (GUI) and hieditor-cli.exe (CLI)
 ```
 
-Alternatively grab `dist/HiEditorPro-v*.zip` (two executables + README, no installer).
+Alternatively grab `dist/HiEditorPro-v*.zip` (two executables + context-menu install scripts + README, no installer).
 
 ## 🖥️ GUI
 
 ```bash
-hieditor-gui test_5gb.log        # open from command line
-hieditor-gui                     # empty window; drag a file in or press Ctrl+O
+hieditor-pro test_5gb.log        # open from command line
+hieditor-pro                     # empty window; drag a file in or press Ctrl+O
 ```
+
+## 🖱️ Explorer Context Menu
+
+After extracting the release zip, run **`install.bat`** (no admin required, idempotent)
+to register "Open with HiEditor Pro" in the Explorer context menu:
+
+- **Windows 11**: shown at the first level of the new context menu (sparse MSIX
+  package + IExplorerCommand COM server; Developer Mode must be enabled, or sign
+  the package with a self-signed certificate)
+- **Windows 10**: shown at the first level of the classic menu (HKCU static verb)
+- Multi-select opens one tab per file; run `uninstall.bat` to remove
+- In-app alternative: **Settings → Register context menu**
+- Troubleshooting logs: `%TEMP%\hieditor_menu.log` (COM server), `%TEMP%\hieditor_pro.log` (app args)
+
+See [CONTEXT-MENU-CHECKLIST.md](CONTEXT-MENU-CHECKLIST.md) for implementation notes.
 
 Key shortcuts:
 

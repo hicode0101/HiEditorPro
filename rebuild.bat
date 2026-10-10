@@ -30,7 +30,7 @@ if /i "%~1"=="test" (
 echo.
 echo === ±‡“ÎÕÍ≥… ===
 echo   CLI : %~dp0target\release\hieditor-cli.exe
-echo   GUI : %~dp0target\release\hieditor-gui.exe
+echo   GUI : %~dp0target\release\hieditor-pro.exe
 exit /b 0
 
 :fail

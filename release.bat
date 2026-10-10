@@ -10,7 +10,7 @@ where cargo >nul 2>nul
 if errorlevel 1 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 
 rem --- 若程序正在运行则无法覆盖 exe ---
-tasklist 2>nul | findstr /i "hieditor-gui.exe" >nul
+tasklist 2>nul | findstr /i "hieditor-pro.exe" >nul
 if not errorlevel 1 (
     echo *** 检测到 HiEditor Pro 正在运行，请先关闭后再打包 ***
     exit /b 1
@@ -31,9 +31,19 @@ if exist "%STAGE%" rmdir /s /q "%STAGE%"
 if exist "%~dp0dist\%DIST%.zip" del /q "%~dp0dist\%DIST%.zip"
 mkdir "%STAGE%" 2>nul
 
-copy /y "%~dp0target\release\hieditor-gui.exe" "%STAGE%" >nul || goto :fail
+copy /y "%~dp0target\release\hieditor-pro.exe" "%STAGE%" >nul || goto :fail
 copy /y "%~dp0target\release\hieditor-cli.exe" "%STAGE%" >nul || goto :fail
 copy /y "%~dp0README.md" "%STAGE%" >nul || goto :fail
+
+rem --- 右键菜单安装文件（install.bat 引导：传统动词 + Win11 稀疏包）---
+copy /y "%~dp0target\release\hieditor_menu.dll" "%STAGE%" >nul || goto :fail
+copy /y "%~dp0install.bat" "%STAGE%" >nul || goto :fail
+copy /y "%~dp0uninstall.bat" "%STAGE%" >nul || goto :fail
+mkdir "%STAGE%\sparse\assets" 2>nul
+copy /y "%~dp0sparse\AppxManifest.xml" "%STAGE%\sparse\" >nul || goto :fail
+copy /y "%~dp0sparse\setup-sparse.ps1" "%STAGE%\sparse\" >nul || goto :fail
+copy /y "%~dp0sparse\assets\Square150x150Logo.png" "%STAGE%\sparse\assets\" >nul || goto :fail
+copy /y "%~dp0sparse\assets\Square44x44Logo.png" "%STAGE%\sparse\assets\" >nul || goto :fail
 
 echo === [3/4] 压缩为 zip ===
 powershell -NoProfile -Command "Compress-Archive -Path '%STAGE%\*' -DestinationPath '%~dp0dist\%DIST%.zip' -Force"
@@ -42,7 +52,7 @@ if errorlevel 1 goto :fail
 echo === [4/4] 完成 ===
 for %%A in ("%~dp0dist\%DIST%.zip") do echo   产物: %DIST%.zip ^(%%~zA 字节^)
 echo   位置: %~dp0dist\%DIST%.zip
-echo   内容: hieditor-gui.exe / hieditor-cli.exe / README.md
+echo   内容: hieditor-pro.exe / hieditor-cli.exe / README.md / 右键菜单安装文件
 exit /b 0
 
 :fail

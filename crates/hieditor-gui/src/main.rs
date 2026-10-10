@@ -36,6 +36,10 @@ use fonts::UserFont;
 // Win32 标准打印对话框 + GDI 分页文本打印（后台线程）
 mod printing;
 
+// ---------- 右键菜单集成 ----------
+// 传统动词注册（--register/--unregister）+ 启动参数日志（%TEMP%\hieditor_pro.log）
+mod shell_menu;
+
 /// 每行渲染字节上限（超长行截断显示）
 const MAX_LINE_BYTES: usize = 80_000;
 /// GUI 搜索命中上限
@@ -169,6 +173,10 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "settings.shortcut") => if zh { "创建桌面快捷方式" } else { "Create desktop shortcut" },
         (_, "settings.shortcut_ok") => if zh { "桌面快捷方式已创建" } else { "Desktop shortcut created" },
         (_, "settings.shortcut_fail") => if zh { "创建桌面快捷方式失败" } else { "Failed to create shortcut" },
+        (_, "settings.ctxmenu") => if zh { "注册右键菜单打开" } else { "Register context menu" },
+        (_, "settings.ctxmenu_ok") => if zh { "右键菜单已注册：右键文件即可使用（Win11 新菜单第一层；若未出现请重启资源管理器）" } else { "Context menu registered (Win11 first level; restart Explorer if it does not show up)" },
+        (_, "settings.ctxmenu_classic") => if zh { "传统右键菜单已注册（Win10 / Win11「显示更多选项」）；Win11 新菜单注册失败：" } else { "Classic context menu registered; Win11 native menu registration failed: " },
+        (_, "settings.ctxmenu_fail") => if zh { "注册右键菜单失败：" } else { "Failed to register context menu: " },
         (_, "about.title") => if zh { "关于" } else { "About" },
         (_, "about.src") => if zh { "开源地址" } else { "Source" },
         (_, "about.wx") => if zh { "作者微信" } else { "Author WeChat" },
@@ -754,6 +762,8 @@ struct App {
     reload_requested: Option<u64>,
     /// 上次文件变化轮询时刻（1s 节流，避免每帧 stat）
     last_poll: Instant,
+    /// 本轮批量打开中应落为活动标签页的 tab id（首个文件；None = 无批量打开进行）
+    open_batch_first: Option<u64>,
 }
 
 impl App {
@@ -796,10 +806,19 @@ impl App {
             reload_confirm: None,
             reload_requested: None,
             last_poll: Instant::now(),
+            open_batch_first: None,
         };
-        if let Some(p) = std::env::args().nth(1) {
-            app.path_input = p.clone();
-            app.request_open(PathBuf::from(p));
+        // 命令行传入的全部路径按序各开一个标签页（右键多选 / 拖拽多文件场景）
+        let file_args: Vec<PathBuf> = std::env::args()
+            .skip(1)
+            .filter(|a| !a.trim().is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if let Some(first) = file_args.first() {
+            app.path_input = first.display().to_string();
+        }
+        if !file_args.is_empty() {
+            app.request_open_paths(file_args);
         }
         // fonts/ 目录扫描结果提示
         if fonts_loaded > 0 || fonts_failed > 0 {
@@ -889,36 +908,50 @@ impl App {
     }
 
     fn request_open(&mut self, path: PathBuf) {
+        self.request_open_paths(vec![path]);
+    }
+
+    /// 批量打开（命令行多参数 / 右键菜单多选）：每条路径一个标签页并行加载，
+    /// 共享一条消息通道；首个文件落为活动标签页。替换掉仍在进行的旧加载。
+    fn request_open_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
         let lang = self.lang;
         // 终止上一个仍在进行的加载
         for c in self.load_cancels.values() {
             c.store(true, Ordering::Relaxed);
         }
         self.load_cancels.clear();
-
-        // 记录到最近文件列表
-        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if !self.recent_files.contains(&canon) {
-            self.recent_files.insert(0, canon.clone());
-            if self.recent_files.len() > 20 {
-                self.recent_files.truncate(20);
-            }
-        } else if let Some(pos) = self.recent_files.iter().position(|p| *p == canon) {
-            let f = self.recent_files.remove(pos);
-            self.recent_files.insert(0, f);
-        }
-        // 持久化到磁盘
-        save_recent_files(&self.recent_files);
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.load_cancels.insert(id, Arc::clone(&cancel));
+        self.open_batch_first = None;
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.open_rx = Some(rx);
         self.open_error = None;
-        self.status = format!("{} {}", tr(lang, "status.reading"), path.display());
-        spawn_load_thread(path, id, cancel, tx);
+        for path in paths {
+            // 记录到最近文件列表
+            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !self.recent_files.contains(&canon) {
+                self.recent_files.insert(0, canon.clone());
+                if self.recent_files.len() > 20 {
+                    self.recent_files.truncate(20);
+                }
+            } else if let Some(pos) = self.recent_files.iter().position(|p| *p == canon) {
+                let f = self.recent_files.remove(pos);
+                self.recent_files.insert(0, f);
+            }
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            if self.open_batch_first.is_none() {
+                self.open_batch_first = Some(id);
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            self.load_cancels.insert(id, Arc::clone(&cancel));
+            self.status = format!("{} {}", tr(lang, "status.reading"), path.display());
+            spawn_load_thread(path, id, cancel, tx.clone());
+        }
+        // 持久化到磁盘
+        save_recent_files(&self.recent_files);
     }
 
     /// 重新加载标签页对应的文件（后台管线复用；Head 消息按 tab_id 命中既有标签时整体替换）。
@@ -1883,6 +1916,26 @@ fn apply_editor_font(ctx: &egui::Context, file: &str, index: u32) {
 }
 
 fn main() -> eframe::Result<()> {
+    // 右键菜单注册/卸载模式：写完 HKCU 传统动词即退出，不进 GUI
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(first) = cli_args.first() {
+        if first == "--register-context-menu" {
+            // 静默一键注册（设置界面按钮同一函数）：传统动词 + Win11 稀疏包，结果写日志
+            let msg = match shell_menu::register_context_menu() {
+                shell_menu::RegisterResult::Ok => "一键注册成功".to_string(),
+                shell_menu::RegisterResult::ClassicOnly(e) => format!("一键注册（仅传统动词）: {e}"),
+                shell_menu::RegisterResult::Failed(e) => format!("一键注册失败: {e}"),
+            };
+            shell_menu::log_line(&msg);
+            return Ok(());
+        }
+        if shell_menu::handle_cli(first) {
+            return Ok(());
+        }
+    }
+    // 启动参数埋点（验证右键菜单调用链：菜单 → 组件 Invoke → 本进程收到路径）
+    shell_menu::log_launch(&cli_args);
+
     // 窗口图标（任务栏/标题栏）
     let icon_rgba = image::load_from_memory(LOGO_PNG)
         .expect("内置 logo 解码失败")
@@ -2033,7 +2086,11 @@ impl eframe::App for App {
                             }
                         } else {
                             self.tabs.push(t);
-                            self.active = self.tabs.len() - 1;
+                            // 批量打开时仅首个文件抢焦点，其余标签后台追加
+                            if self.open_batch_first == Some(tab_id) {
+                                self.open_batch_first = None;
+                                self.active = self.tabs.len() - 1;
+                            }
                             self.status =
                                 format!("{} {title}（{backend} · {size}）· {}", tr(lang, "status.opened"), tr(lang, "status.indexing"));
                         }
@@ -3235,13 +3292,26 @@ impl eframe::App for App {
                 ui.add_space(14.0);
                 ui.separator();
                 ui.add_space(10.0);
-                if ui.button(tr(lang, "settings.shortcut")).clicked() {
-                    self.status = if create_desktop_shortcut() {
-                        tr(lang, "settings.shortcut_ok").into()
-                    } else {
-                        tr(lang, "settings.shortcut_fail").into()
-                    };
-                }
+                ui.horizontal(|ui| {
+                    if ui.button(tr(lang, "settings.shortcut")).clicked() {
+                        self.status = if create_desktop_shortcut() {
+                            tr(lang, "settings.shortcut_ok").into()
+                        } else {
+                            tr(lang, "settings.shortcut_fail").into()
+                        };
+                    }
+                    if ui.button(tr(lang, "settings.ctxmenu")).clicked() {
+                        self.status = match shell_menu::register_context_menu() {
+                            shell_menu::RegisterResult::Ok => tr(lang, "settings.ctxmenu_ok").into(),
+                            shell_menu::RegisterResult::ClassicOnly(e) => {
+                                format!("{}{e}", tr(lang, "settings.ctxmenu_classic"))
+                            }
+                            shell_menu::RegisterResult::Failed(e) => {
+                                format!("{}{e}", tr(lang, "settings.ctxmenu_fail"))
+                            }
+                        };
+                    }
+                })
             });
             if resp.should_close() || resp.backdrop_response.clicked() || close {
                 self.show_settings = false;

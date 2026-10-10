@@ -3,7 +3,8 @@
 #   同步为 tag 版本（程序"关于"里的版本号取自编译期 CARGO_PKG_VERSION，随之一致），
 #   打包 HiEditorPro-v{tag版本}.zip 并自动发布到 GitHub Release
 # - 手动触发（workflow_dispatch）：按 Cargo.toml 版本编译打包，上传 Artifacts
-# 产物：HiEditorPro-v{版本}.zip，内含 hieditor-pro.exe（由 hieditor-gui.exe 改名）
+# 产物：HiEditorPro-v{版本}.zip，内含 hieditor-pro.exe 与右键菜单安装文件
+#       （install.bat / uninstall.bat / hieditor_menu.dll / sparse\ 稀疏包脚本）
 
 name: Package
 
@@ -60,19 +61,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # 只编译 GUI 及其依赖（产物只需要 GUI 的 exe），速度更快
+      # （crate 名为 hieditor-gui，二进制产物为 hieditor-pro.exe）
       - name: 编译 release
         run: cargo build --release -p hieditor-gui
 
-      # 复刻 package.bat：准备暂存目录 → hieditor-gui.exe 改名 hieditor-pro.exe → 压缩 zip
+      # 复刻 package.bat：暂存目录 → 复制 exe/dll + 右键菜单安装文件 → 压缩 zip
       - name: 打包
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $gui = 'target/release/hieditor-gui.exe'
-          if (-not (Test-Path $gui)) { throw "未找到 $gui" }
+          $exe = 'target/release/hieditor-pro.exe'
+          $dll = 'target/release/hieditor_menu.dll'
+          if (-not (Test-Path $exe)) { throw "未找到 $exe" }
+          if (-not (Test-Path $dll)) { throw "未找到 $dll" }
           $dist = "HiEditorPro-v${{ steps.ver.outputs.version }}"
-          New-Item -ItemType Directory -Force -Path "dist/$dist" | Out-Null
-          Copy-Item $gui "dist/$dist/hieditor-pro.exe"
+          New-Item -ItemType Directory -Force -Path "dist/$dist/sparse/assets" | Out-Null
+          Copy-Item $exe "dist/$dist/"
+          Copy-Item $dll "dist/$dist/"
+          Copy-Item install.bat, uninstall.bat "dist/$dist/"
+          Copy-Item sparse/AppxManifest.xml, sparse/setup-sparse.ps1 "dist/$dist/sparse/"
+          Copy-Item sparse/assets/Square150x150Logo.png, sparse/assets/Square44x44Logo.png "dist/$dist/sparse/assets/"
           Compress-Archive -Path "dist/$dist/*" -DestinationPath "dist/$dist.zip" -Force
           Get-Item "dist/$dist.zip" | ForEach-Object { "产物: $($_.Name) ($($_.Length) 字节)" }
 

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "hieditor-gui"
+name = "hieditor-pro"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.build-dependencies]
@@ -27,6 +27,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_Memory",
 ] }
