@@ -1665,6 +1665,8 @@ dependencies = [
  "image",
  "memchr",
  "rfd",
+ "serde",
+ "serde_json",
  "sys-locale",
  "windows-sys 0.59.0",
  "winresource",

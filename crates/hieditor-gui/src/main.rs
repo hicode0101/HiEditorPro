@@ -40,6 +40,10 @@ mod printing;
 // 传统动词注册（--register/--unregister）+ 启动参数日志（%TEMP%\hieditor_pro.log）
 mod shell_menu;
 
+// ---------- 桌面快捷方式 ----------
+// 原生 COM IShellLinkW 创建 .lnk（不经 PowerShell，无控制台闪现）
+mod shortcut;
+
 /// 每行渲染字节上限（超长行截断显示）
 const MAX_LINE_BYTES: usize = 80_000;
 /// GUI 搜索命中上限
@@ -175,7 +179,7 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "settings.shortcut_fail") => if zh { "创建桌面快捷方式失败" } else { "Failed to create shortcut" },
         (_, "settings.ctxmenu") => if zh { "注册右键菜单打开" } else { "Register context menu" },
         (_, "settings.ctxmenu_ok") => if zh { "右键菜单已注册：右键文件即可使用（Win11 新菜单第一层；若未出现请重启资源管理器）" } else { "Context menu registered (Win11 first level; restart Explorer if it does not show up)" },
-        (_, "settings.ctxmenu_classic") => if zh { "传统右键菜单已注册（Win10 / Win11「显示更多选项」）；Win11 新菜单注册失败：" } else { "Classic context menu registered; Win11 native menu registration failed: " },
+        (_, "settings.ctxmenu_classic") => if zh { "传统右键菜单已注册（Win10 / Win11「显示更多选项」）；Win11 新菜单未注册：" } else { "Classic context menu registered; Win11 native menu not registered: " },
         (_, "settings.ctxmenu_fail") => if zh { "注册右键菜单失败：" } else { "Failed to register context menu: " },
         (_, "about.title") => if zh { "关于" } else { "About" },
         (_, "about.src") => if zh { "开源地址" } else { "Source" },
@@ -314,22 +318,6 @@ fn save_settings(lang: Lang, theme: ThemeMode) {
             format!("language={}\ntheme={}\n", lang.save_key(), theme.save_key()),
         );
     }
-}
-
-fn create_desktop_shortcut() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
-    let dir = exe.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-    let script = format!(
-        "$ws = New-Object -ComObject WScript.Shell; $lnk = $ws.CreateShortcut((New-Object -ComObject Shell.Application).NameSpace(0).Self.Path + '\\HiEditor Pro.lnk'); $lnk.TargetPath = '{}'; $lnk.WorkingDirectory = '{}'; $lnk.IconLocation = '{}'; $lnk.Save()",
-        exe.display(),
-        dir.display(),
-        exe.display()
-    );
-    std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 
@@ -930,7 +918,7 @@ impl App {
         self.open_error = None;
         for path in paths {
             // 记录到最近文件列表
-            let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let canon = clean_win_path(std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()));
             if !self.recent_files.contains(&canon) {
                 self.recent_files.insert(0, canon.clone());
                 if self.recent_files.len() > 20 {
@@ -1834,20 +1822,50 @@ fn cursor_at_pointer_wrap(
     }
 }
 
-// 最近文件持久化
+// 最近文件持久化（JSON：每条包含文件名 name 与完整路径 path）
 fn recent_conf_path() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|d| d.join("recent_files.txt")))
+        .and_then(|e| e.parent().map(|d| d.join("recent_files.json")))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RecentEntry {
+    name: String,
+    path: String,
+}
+
+fn recent_entry(path: &Path) -> RecentEntry {
+    RecentEntry {
+        name: path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string()),
+        path: path.display().to_string(),
+    }
+}
+
+/// canonicalize 在 Windows 上返回 `\\?\` 开头的扩展路径，剥掉前缀便于阅读与比较
+fn clean_win_path(p: PathBuf) -> PathBuf {
+    let Some(s) = p.as_os_str().to_str() else { return p };
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p
+    }
 }
 
 fn load_recent_files() -> Vec<PathBuf> {
     let Some(p) = recent_conf_path() else { return Vec::new() };
     std::fs::read_to_string(p)
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(PathBuf::from)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<RecentEntry>>(&text).ok())
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|e| clean_win_path(PathBuf::from(e.path)))
                 .collect()
         })
         .unwrap_or_default()
@@ -1855,12 +1873,10 @@ fn load_recent_files() -> Vec<PathBuf> {
 
 fn save_recent_files(files: &[PathBuf]) {
     if let Some(p) = recent_conf_path() {
-        let text: String = files
-            .iter()
-            .map(|f| f.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let _ = std::fs::write(p, text);
+        let entries: Vec<RecentEntry> = files.iter().map(|f| recent_entry(f)).collect();
+        if let Ok(text) = serde_json::to_string_pretty(&entries) {
+            let _ = std::fs::write(p, text);
+        }
     }
 }
 
@@ -3294,7 +3310,7 @@ impl eframe::App for App {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button(tr(lang, "settings.shortcut")).clicked() {
-                        self.status = if create_desktop_shortcut() {
+                        self.status = if shortcut::create_desktop_shortcut() {
                             tr(lang, "settings.shortcut_ok").into()
                         } else {
                             tr(lang, "settings.shortcut_fail").into()

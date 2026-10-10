@@ -19,15 +19,22 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 arboard = "3"
 rfd = "0.15"
 sys-locale = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 eframe = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Wdk_System_SystemServices",
 ] }
