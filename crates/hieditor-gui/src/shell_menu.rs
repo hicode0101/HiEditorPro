@@ -168,10 +168,10 @@ fn unregister_verbs() -> Result<(), String> {
 
 /// 注册结果：设置按钮据此显示状态栏文案
 pub enum RegisterResult {
-    /// 全部成功（传统动词 + Win11 稀疏包）
+    /// 成功：Win10 传统动词已注册；Win11 额外注册了稀疏包
     Ok,
-    /// 传统动词成功，Win11 稀疏包未注册（Win10 系统跳过 / Win11 注册失败附原因）
-    ClassicOnly(String),
+    /// 传统动词成功，但 Win11 稀疏包注册失败（附原因）
+    Partial(String),
     /// 传统动词注册失败
     Failed(String),
 }
@@ -273,22 +273,23 @@ pub fn register_context_menu() -> RegisterResult {
         return RegisterResult::Failed(e);
     }
     log_line("注册成功");
-    // Win10 上稀疏包清单 MinVersion 要求 Win11（22000+），强行注册只会报 0x80073CFD
+    // Win10 没有 Win11 新菜单（稀疏包清单 MinVersion 要求 22000+，强行注册只会报
+    // 0x80073CFD），跳过即视为注册成功
     if !is_windows_11() {
         let build = windows_build();
         let msg = if build > 0 {
-            format!("当前系统为 Windows 10（build {build}），Win11 新版菜单仅 Windows 11 提供，已跳过")
+            format!("当前系统为 Windows 10（build {build}），无 Win11 新版菜单，已跳过稀疏包注册")
         } else {
-            "当前系统不是 Windows 11，Win11 新版菜单已跳过".to_string()
+            "当前系统不是 Windows 11，已跳过稀疏包注册".to_string()
         };
-        log_line(&format!("跳过稀疏包注册: {msg}"));
-        return RegisterResult::ClassicOnly(msg);
+        log_line(&msg);
+        return RegisterResult::Ok;
     }
     match register_sparse_package() {
         Ok(()) => RegisterResult::Ok,
         Err(e) => {
             log_line(&format!("稀疏包注册失败: {e}"));
-            RegisterResult::ClassicOnly(e)
+            RegisterResult::Partial(e)
         }
     }
 }

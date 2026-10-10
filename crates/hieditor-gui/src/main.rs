@@ -178,8 +178,8 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "settings.shortcut_ok") => if zh { "桌面快捷方式已创建" } else { "Desktop shortcut created" },
         (_, "settings.shortcut_fail") => if zh { "创建桌面快捷方式失败" } else { "Failed to create shortcut" },
         (_, "settings.ctxmenu") => if zh { "注册右键菜单打开" } else { "Register context menu" },
-        (_, "settings.ctxmenu_ok") => if zh { "右键菜单已注册：右键文件即可使用（Win11 新菜单第一层；若未出现请重启资源管理器）" } else { "Context menu registered (Win11 first level; restart Explorer if it does not show up)" },
-        (_, "settings.ctxmenu_classic") => if zh { "传统右键菜单已注册（Win10 / Win11「显示更多选项」）；Win11 新菜单未注册：" } else { "Classic context menu registered; Win11 native menu not registered: " },
+        (_, "settings.ctxmenu_ok") => if zh { "右键菜单激活成功" } else { "Context menu activated" },
+        (_, "settings.ctxmenu_classic") => if zh { "传统菜单已注册，但 Win11 新菜单未注册：" } else { "Classic menu registered, but the Win11 native menu was not: " },
         (_, "settings.ctxmenu_fail") => if zh { "注册右键菜单失败：" } else { "Failed to register context menu: " },
         (_, "about.title") => if zh { "关于" } else { "About" },
         (_, "about.src") => if zh { "开源地址" } else { "Source" },
@@ -1939,7 +1939,7 @@ fn main() -> eframe::Result<()> {
             // 静默一键注册（设置界面按钮同一函数）：传统动词 + Win11 稀疏包，结果写日志
             let msg = match shell_menu::register_context_menu() {
                 shell_menu::RegisterResult::Ok => "一键注册成功".to_string(),
-                shell_menu::RegisterResult::ClassicOnly(e) => format!("一键注册（仅传统动词）: {e}"),
+                shell_menu::RegisterResult::Partial(e) => format!("一键注册（仅传统动词）: {e}"),
                 shell_menu::RegisterResult::Failed(e) => format!("一键注册失败: {e}"),
             };
             shell_menu::log_line(&msg);
@@ -3319,7 +3319,7 @@ impl eframe::App for App {
                     if ui.button(tr(lang, "settings.ctxmenu")).clicked() {
                         self.status = match shell_menu::register_context_menu() {
                             shell_menu::RegisterResult::Ok => tr(lang, "settings.ctxmenu_ok").into(),
-                            shell_menu::RegisterResult::ClassicOnly(e) => {
+                            shell_menu::RegisterResult::Partial(e) => {
                                 format!("{}{e}", tr(lang, "settings.ctxmenu_classic"))
                             }
                             shell_menu::RegisterResult::Failed(e) => {
