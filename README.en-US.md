@@ -116,7 +116,7 @@ cargo build --release
 # Outputs: target/release/hieditor-pro.exe (GUI) and hieditor-cli.exe (CLI)
 ```
 
-Alternatively grab `dist/HiEditorPro-v*.zip` (two executables + context-menu install scripts + README, no installer).
+Alternatively grab `dist/HiEditorPro-v*.zip` (two executables + context-menu registration files + README, no installer).
 
 ## 🖥️ GUI
 
@@ -127,18 +127,25 @@ hieditor-pro                     # empty window; drag a file in or press Ctrl+O
 
 ## 🖱️ Explorer Context Menu
 
-After extracting the release zip, run **`install.bat`** (no admin required, idempotent)
-to register "Open with HiEditor Pro" in the Explorer context menu:
+Run **`hieditor-pro --register`** (no admin required, idempotent), or use
+**Settings → Register context menu** in the app, to register "Open with HiEditor Pro"
+in the Explorer context menu:
 
-- **Windows 11**: shown at the first level of the new context menu (sparse MSIX
-  package + IExplorerCommand COM server; Developer Mode must be enabled, or sign
-  the package with a self-signed certificate)
+- **Windows 11**: shown at the first level of the new context menu and in the
+  classic menu ("Show more options") — the same single entry from the sparse MSIX
+  package + IExplorerCommand COM server, no duplicates. The release zip ships a
+  self-signed package: confirm the UAC prompt once on first registration (imports
+  the signing certificate into the machine trusted store); afterwards neither
+  Developer Mode nor admin is needed. Dev layouts or failed registrations fall
+  back to the classic static verb (classic menu only); unsigned registration
+  requires Developer Mode
 - **Windows 10**: shown at the first level of the classic menu (HKCU static verb)
-- Multi-select opens one tab per file; run `uninstall.bat` to remove
-- In-app alternative: **Settings → Register context menu**
+- Multi-select opens one tab per file
+- Run `hieditor-pro --unregister` to remove (also removes the Win11 sparse package)
 - Troubleshooting logs: `%TEMP%\hieditor_menu.log` (COM server), `%TEMP%\hieditor_pro.log` (app args)
 
-See [CONTEXT-MENU-CHECKLIST.md](CONTEXT-MENU-CHECKLIST.md) for implementation notes.
+See [docs/CONTEXT-MENU.md](docs/CONTEXT-MENU.md) for build artifacts, the full
+registration/unregistration flow, and error-code troubleshooting for both mechanisms.
 
 Key shortcuts:
 

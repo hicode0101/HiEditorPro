@@ -7,10 +7,13 @@ testfiles/
 /dist
 
 
-# 稀疏包注册生成的运行产物（清单/脚本/资源仍纳入版本管理）
+# 稀疏包注册生成的运行产物（清单/资源仍纳入版本管理）
 /sparse/hieditor-pro.exe
 /sparse/hieditor-gui.exe
 /sparse/hieditor_menu.dll
 /sparse/microsoft.system.package.metadata/
-/sparse/recent_files.txt
+/sparse/recent_files.json
 /sparse/hieditor.conf
+/sparse/HiEditorProContextMenu.msix
+/sparse/HiEditorPro.cer
+/signing/hieditor-signing.pfx

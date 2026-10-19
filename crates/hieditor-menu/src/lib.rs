@@ -6,16 +6,16 @@
 // 注册仅供 CoCreateInstance 激活测试，二者缺一不可（详见 CONTEXT-MENU-CHECKLIST.md）。
 // 日志写入 %TEMP%\hieditor_menu.log，便于排查加载失败。
 
-use std::sync::atomic::{AtomicPtr, Ordering};
-
 use windows::Win32::Foundation::{
-    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_NOTIMPL, E_POINTER, HINSTANCE,
-    HMODULE,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_NOTIMPL, E_POINTER, HMODULE,
 };
 use windows::Win32::System::Com::{
     CoTaskMemAlloc, CoTaskMemFree, IBindCtx, IClassFactory, IClassFactory_Impl,
 };
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+};
 use windows::Win32::UI::Shell::{
     IEnumExplorerCommand, IExplorerCommand, IExplorerCommand_Impl, IShellItem, IShellItemArray,
     ShellExecuteW, SIGDN_FILESYSPATH,
@@ -35,21 +35,6 @@ const MENU_TOOLTIP: &str = "用 HiEditor Pro 打开选中的文件";
 /// 主程序候选名：统一为 hieditor-pro.exe（hieditor-gui.exe 为旧版兼容回退），
 /// 取第一个与 DLL 同目录存在者（不写死绝对路径，随安装位置迁移）
 const EXE_CANDIDATES: [&str; 2] = ["hieditor-pro.exe", "hieditor-gui.exe"];
-
-static G_HINSTANCE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-
-#[no_mangle]
-pub extern "system" fn DllMain(
-    hinst: HINSTANCE,
-    reason: u32,
-    _reserved: *mut std::ffi::c_void,
-) -> BOOL {
-    // reason == 1 即 DLL_PROCESS_ATTACH
-    if reason == 1 {
-        G_HINSTANCE.store(hinst.0, Ordering::Relaxed);
-    }
-    BOOL(1)
-}
 
 #[no_mangle]
 pub extern "system" fn DllGetClassObject(
@@ -87,15 +72,20 @@ fn log_line(text: &str) {
     }
 }
 
-// 与主程序同目录的绝对路径（UTF-16，带结尾 0）
+// 与主程序同目录的绝对路径（UTF-16）。用 DllGetClassObject 函数地址反查所在模块
+// 获取本 DLL 的 HINSTANCE——不能依赖 DllMain 存句柄：用户定义的 DllMain 在
+// 部分 COM 加载场景下不会被调用，导致 G_HINSTANCE 为空、GetIcon 拿不到路径。
 fn host_exe_path() -> Option<Vec<u16>> {
-    let raw = G_HINSTANCE.load(Ordering::Relaxed);
-    if raw.is_null() {
-        return None;
-    }
+    let mut hmod = HMODULE::default();
     unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR::from_raw(DllGetClassObject as *const _),
+            &mut hmod,
+        )
+        .ok()?;
         let mut buf = [0u16; 1024];
-        let n = GetModuleFileNameW(Some(HMODULE(raw)), &mut buf);
+        let n = GetModuleFileNameW(Some(hmod), &mut buf);
         if n == 0 {
             return None;
         }
@@ -105,6 +95,7 @@ fn host_exe_path() -> Option<Vec<u16>> {
         for name in EXE_CANDIDATES {
             let mut out = dir.to_vec();
             out.extend(name.encode_utf16());
+            out.push(0); // ShellExecuteW 与 host_exe_path_string 都依赖 0 终止
             if file_exists(&out) {
                 return Some(out);
             }
@@ -112,6 +103,7 @@ fn host_exe_path() -> Option<Vec<u16>> {
         // 都不存在时退回首选名，让 ShellExecute 给出可见的失败
         let mut out = dir.to_vec();
         out.extend(EXE_CANDIDATES[0].encode_utf16());
+        out.push(0);
         Some(out)
     }
 }

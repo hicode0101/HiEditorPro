@@ -6,7 +6,8 @@
     xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
     xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
     xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
-    IgnorableNamespaces="uap rescap desktop4 desktop5 com">
+    xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+    IgnorableNamespaces="uap rescap desktop4 desktop5 com uap10">
 
   <Identity Name="HiEditorProContextMenu" Publisher="CN=HiEditorPro" Version="1.0.0.0" />
 
@@ -14,6 +15,7 @@
     <DisplayName>HiEditor Pro</DisplayName>
     <PublisherDisplayName>HiEditorPro</PublisherDisplayName>
     <Logo>assets\Square44x44Logo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
   </Properties>
 
   <Resources>

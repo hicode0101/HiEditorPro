@@ -1,13 +1,14 @@
 //! shell_menu —— Windows 资源管理器右键菜单集成（传统动词注册 + 启动参数日志）
 //!
 //! - `--register` / `--unregister`：用原生注册表 API 写/删 HKCU\Software\Classes
-//!   下的静态动词（当前用户作用域，免管理员；Win10 菜单第一层可见，Win11 收进「显示更多选项」）
+//!   下的静态动词（当前用户作用域，免管理员；Win10 的唯一入口，Win11 仅作
+//!   稀疏包注册失败时的回退，避免与包条目在经典菜单中重复）
 //! - Win11 新版菜单第一层由 hieditor-menu COM 组件 + 稀疏 MSIX 包提供，
-//!   部署走根目录 install.bat（见 sparse/ 与 CONTEXT-MENU-CHECKLIST.md）；
+//!   由 `--register` / 设置界面一键注册（包根布局见 sparse/）；
 //!   仅此一步需调 PowerShell（加 CREATE_NO_WINDOW 隐藏控制台）
 //! - 每次启动把命令行参数追加到 %TEMP%\hieditor_pro.log，便于验证菜单调用链
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 当前 Windows build 号（查询失败返回 0）。Win11 = 22000+
 fn windows_build() -> u32 {
@@ -42,6 +43,12 @@ fn menu_title() -> &'static str {
 /// 稀疏 MSIX 包名 / 菜单 COM 类 CLSID（与 sparse\AppxManifest.xml 保持一致）
 const PACKAGE_NAME: &str = "HiEditorProContextMenu";
 const CLSID_BRACED: &str = "{2E7EED97-9BAE-4334-8DA1-8DE129DA7024}";
+
+/// 发行包内置的签名稀疏包 / 公钥证书文件名（位于 exe 旁 sparse\ 目录，构建时生成）
+const SIGNED_PACKAGE_FILE: &str = "HiEditorProContextMenu.msix";
+const SIGNED_CERT_FILE: &str = "HiEditorPro.cer";
+/// 签名包清单声明的可执行文件名（签名后不可改，ExternalLocation 内必须同名）
+const MANIFEST_EXE: &str = "hieditor-pro.exe";
 
 /// GUI 进程无控制台，子进程默认闪现新窗口；此标志让子进程静默运行
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -202,42 +209,43 @@ fn patch_manifest_executable(xml: &str, exe_name: &str) -> String {
     out
 }
 
-/// 注册 Win11 新菜单稀疏包：组装包根（exe/dll/清单）→ CLSID HKCU → Add-AppxPackage -Register。
-/// 幂等：同版本先移除再注册；需系统已开启开发者模式（免签名免管理员）。
+/// 查询稀疏包当前是否已注册（PowerShell 子进程，结果影响是否回退传统动词）
+fn sparse_package_registered() -> bool {
+    let ps = format!("if (Get-AppxPackage -Name {PACKAGE_NAME}) {{ exit 0 }} else {{ exit 1 }}");
+    run_powershell(&ps)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 无窗口运行 PowerShell 命令（GUI 进程无控制台，子进程默认闪现新窗口）
+fn run_powershell(ps: &str) -> Result<std::process::Output, String> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("无法启动 powershell: {e}"))
+}
+
+/// 注册 Win11 新菜单稀疏包。优先用发行包内置签名包（sparse\*.msix + .cer，
+/// 免开发者模式；证书未受信时弹一次 UAC 导入本机受信任存储）。无签名包时
+/// 回退未签名清单（-Register，需系统已开启开发者模式）。均幂等：同版本先移除再注册。
 fn register_sparse_package() -> Result<(), String> {
-    let Some(dir) = locate_sparse_dir() else {
-        return Err("未找到 sparse\\AppxManifest.xml（安装不完整，请用发行包重装）".into());
-    };
     let exe = std::env::current_exe().map_err(|e| format!("获取自身路径失败: {e}"))?;
     let exe_name = exe
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "hieditor-pro.exe".into());
-    let dll = exe
+        .unwrap_or_else(|| MANIFEST_EXE.into());
+    let exe_dir = exe
         .parent()
-        .map(|d| d.join("hieditor_menu.dll"))
-        .ok_or_else(|| "获取程序目录失败".to_string())?;
+        .ok_or_else(|| "获取程序目录失败".to_string())?
+        .to_path_buf();
+    let dll = exe_dir.join("hieditor_menu.dll");
     if !dll.is_file() {
         return Err("未找到 hieditor_menu.dll（安装不完整）".into());
     }
-    // 组件与主程序就位（同路径则跳过，运行中的 exe 无法自我覆盖）
-    let exe_dst = dir.join(&exe_name);
-    if exe != exe_dst {
-        std::fs::copy(&exe, &exe_dst).map_err(|e| format!("复制 exe 失败: {e}"))?;
-    }
-    let dll_dst = dir.join("hieditor_menu.dll");
-    if dll != dll_dst {
-        std::fs::copy(&dll, &dll_dst).map_err(|e| format!("复制 dll 失败: {e}"))?;
-    }
-    // 清单 Executable 对齐实际 exe 名
-    let manifest = dir.join("AppxManifest.xml");
-    let xml = std::fs::read_to_string(&manifest).map_err(|e| format!("读取清单失败: {e}"))?;
-    let patched = patch_manifest_executable(&xml, &exe_name);
-    if patched != xml {
-        std::fs::write(&manifest, patched).map_err(|e| format!("写清单失败: {e}"))?;
-    }
     // CLSID 写 HKCU（当前用户，免管理员；菜单激活走清单 com:ComServer）
-    let dll_reg = dll_dst.to_string_lossy().to_string();
+    let dll_reg = dll.to_string_lossy().to_string();
     let clsid_key = format!(r"Software\Classes\CLSID\{CLSID_BRACED}");
     reg_set(&clsid_key, None, "HiEditor Pro IExplorerCommand")?;
     reg_set(&format!("{clsid_key}\\InprocServer32"), None, &dll_reg)?;
@@ -246,50 +254,170 @@ fn register_sparse_package() -> Result<(), String> {
         Some("ThreadingModel"),
         "Apartment",
     )?;
-    // 幂等注册稀疏包（0x80073CFB：同版本包必须先移除）
+    let msix = exe_dir.join("sparse").join(SIGNED_PACKAGE_FILE);
+    if msix.is_file() {
+        return register_signed_package(&msix, &exe_dir, &exe_name);
+    }
+    register_unsigned_package(&exe, &exe_name)
+}
+
+/// 签名稀疏包注册：Add-AppxPackage -Path <msix> -ExternalLocation <exe 目录>。
+/// 流程尽量不破坏已注册的可用状态：先直接注册；证书未受信（0x800B0109/0x800B010A，
+/// AppXSvc 以 SYSTEM 运行只查本机受信任存储）时管理员导入 .cer 后重试（UAC 取消
+/// 则原样返回，已注册的旧包不受影响）；同版本已注册（0x80073CFB/0x80073CF9）才
+/// 先移除再注册（幂等升级）。
+fn register_signed_package(msix: &Path, exe_dir: &Path, exe_name: &str) -> Result<(), String> {
+    if exe_name != MANIFEST_EXE {
+        return Err(format!(
+            "内置签名包要求主程序保持文件名 {MANIFEST_EXE}（如需改名请删除 sparse\\{SIGNED_PACKAGE_FILE} 改用未签名注册）"
+        ));
+    }
+    let msix_s = msix.to_string_lossy().to_string();
+    let dir_s = exe_dir.to_string_lossy().to_string();
+    let add_cmd = |remove_first: bool| {
+        let rm = if remove_first {
+            format!("Get-AppxPackage -Name {PACKAGE_NAME} | Remove-AppxPackage -ErrorAction SilentlyContinue; ")
+        } else {
+            String::new()
+        };
+        format!(
+            "$ErrorActionPreference='Stop'; {rm}Add-AppxPackage -Path '{}' -ExternalLocation '{}'",
+            msix_s, dir_s
+        )
+    };
+    let is_untrusted = |s: &str| {
+        let u = s.to_ascii_uppercase();
+        u.contains("0X800B0109") || u.contains("0X800B010A") || u.contains("CERT_E_UNTRUSTED")
+    };
+    let is_same_version = |s: &str| {
+        let u = s.to_ascii_uppercase();
+        u.contains("0X80073CFB") || u.contains("0X80073CF9")
+    };
+    let mut out = run_powershell(&add_cmd(false))?;
+    if !out.status.success() && is_untrusted(&String::from_utf8_lossy(&out.stderr)) {
+        let cer = msix.with_file_name(SIGNED_CERT_FILE);
+        if !cer.is_file() {
+            return Err(format!(
+                "{}（未找到 {SIGNED_CERT_FILE}，无法自动导入签名证书）",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let import = format!(
+            "try {{ $p = Start-Process -FilePath certutil.exe -ArgumentList '-addstore','TrustedPeople','{}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} catch {{ exit 1 }}",
+            cer.to_string_lossy()
+        );
+        let imp = run_powershell(&import)?;
+        if !imp.status.success() {
+            return Err(format!(
+                "签名证书导入未完成（需在 UAC 弹窗中确认），已保留现有注册。可重试注册，或手动以管理员执行: certutil -addstore TrustedPeople \"{}\"",
+                cer.to_string_lossy()
+            ));
+        }
+        out = run_powershell(&add_cmd(false))?;
+    }
+    if !out.status.success() && is_same_version(&String::from_utf8_lossy(&out.stderr)) {
+        out = run_powershell(&add_cmd(true))?;
+    }
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(())
+}
+
+/// 未签名清单注册（开发布局回退）：组装包根（复制 exe/dll、对齐清单 Executable）→
+/// Add-AppxPackage -Register -ExternalLocation。清单含 AllowExternalContent，
+/// 必须带外部位置；需系统已开启开发者模式（免签名免管理员）。
+fn register_unsigned_package(exe: &Path, exe_name: &str) -> Result<(), String> {
+    let Some(dir) = locate_sparse_dir() else {
+        return Err("未找到 sparse\\AppxManifest.xml（安装不完整，请用发行包重装）".into());
+    };
+    // 组件与主程序就位（同路径则跳过，运行中的 exe 无法自我覆盖）
+    let exe_dst = dir.join(exe_name);
+    if exe != exe_dst {
+        std::fs::copy(exe, &exe_dst).map_err(|e| format!("复制 exe 失败: {e}"))?;
+    }
+    let dll_dst = dir.join("hieditor_menu.dll");
+    if !dll_dst.is_file() {
+        std::fs::copy(exe.parent().unwrap_or(Path::new(".")).join("hieditor_menu.dll"), &dll_dst)
+            .map_err(|e| format!("复制 dll 失败: {e}"))?;
+    }
+    // 清单 Executable 对齐实际 exe 名
+    let manifest = dir.join("AppxManifest.xml");
+    let xml = std::fs::read_to_string(&manifest).map_err(|e| format!("读取清单失败: {e}"))?;
+    let patched = patch_manifest_executable(&xml, exe_name);
+    if patched != xml {
+        std::fs::write(&manifest, patched).map_err(|e| format!("写清单失败: {e}"))?;
+    }
+    // 幂等注册稀疏包（0x80073CFB：同版本包必须先移除）；AllowExternalContent
+    // 清单必须显式指明外部位置，否则报 0x80073CF9
     let ps = format!(
-        "$ErrorActionPreference='Stop'; Get-AppxPackage -Name {PACKAGE_NAME} | Remove-AppxPackage -ErrorAction SilentlyContinue; Add-AppxPackage -Register '{}'",
-        manifest.display()
+        "$ErrorActionPreference='Stop'; Get-AppxPackage -Name {PACKAGE_NAME} | Remove-AppxPackage -ErrorAction SilentlyContinue; Add-AppxPackage -Register '{}' -ExternalLocation '{}'",
+        manifest.display(),
+        dir.display()
     );
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("无法启动 powershell: {e}"))?;
+    let out = run_powershell(&ps)?;
     if !out.status.success() {
         let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(format!(
-            "{detail}（Win11 新菜单需要系统开启开发者模式：设置 → 系统 → 开发者选项）"
+            "{detail}（未签名注册需系统开启开发者模式：设置 → 系统 → 开发者选项；发行包自带签名稀疏包，无需开发者模式）"
         ));
     }
     Ok(())
 }
 
-/// 一键注册：传统动词（Win10 菜单 / Win11「显示更多选项」）+ Win11 新菜单稀疏包。
-pub fn register_context_menu() -> RegisterResult {
-    if let Err(e) = register_verbs() {
-        log_line(&format!("注册失败: {e}"));
-        return RegisterResult::Failed(e);
+/// 取消注册 Win11 新菜单稀疏包：删 HKCU CLSID → Remove-AppxPackage（幂等，包未注册时不报错）。
+fn unregister_sparse_package() -> Result<(), String> {
+    let _ = reg_del(&format!(r"Software\Classes\CLSID\{CLSID_BRACED}"));
+    let ps = format!(
+        "$ErrorActionPreference='Stop'; Get-AppxPackage -Name {PACKAGE_NAME} | Remove-AppxPackage"
+    );
+    let out = run_powershell(&ps)?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(detail);
     }
-    log_line("注册成功");
-    // Win10 没有 Win11 新菜单（稀疏包清单 MinVersion 要求 22000+，强行注册只会报
-    // 0x80073CFD），跳过即视为注册成功
+    Ok(())
+}
+
+/// 一键注册。Win11：只注册稀疏包——它同时覆盖新版菜单与经典菜单（显示更多选项），
+/// 传统动词会造成经典菜单重复，仅在稀疏包注册失败时回退注册；Win10：只注册传统动词
+/// （无新版菜单，稀疏包清单 MinVersion 要求 22000+）。
+pub fn register_context_menu() -> RegisterResult {
     if !is_windows_11() {
-        let build = windows_build();
-        let msg = if build > 0 {
-            format!("当前系统为 Windows 10（build {build}），无 Win11 新版菜单，已跳过稀疏包注册")
-        } else {
-            "当前系统不是 Windows 11，已跳过稀疏包注册".to_string()
-        };
-        log_line(&msg);
+        if let Err(e) = register_verbs() {
+            log_line(&format!("注册失败: {e}"));
+            return RegisterResult::Failed(e);
+        }
+        log_line("注册成功");
         return RegisterResult::Ok;
     }
     match register_sparse_package() {
-        Ok(()) => RegisterResult::Ok,
+        Ok(()) => {
+            // 清理可能残留的传统动词，避免经典菜单出现两个相同条目
+            let _ = unregister_verbs();
+            RegisterResult::Ok
+        }
         Err(e) => {
             log_line(&format!("稀疏包注册失败: {e}"));
-            RegisterResult::Partial(e)
+            // 回退传统动词仅在包未注册时进行：包仍注册着（如证书未确认但旧包可用）
+            // 时补动词会让经典菜单出现重复条目
+            if sparse_package_registered() {
+                RegisterResult::Partial(e)
+            } else {
+                let fallback = match register_verbs() {
+                    Ok(()) => {
+                        Some("已回退注册传统动词，条目在经典菜单（显示更多选项）中可见".to_string())
+                    }
+                    Err(ve) => {
+                        log_line(&format!("传统动词回退注册失败: {ve}"));
+                        None
+                    }
+                };
+                RegisterResult::Partial(match fallback {
+                    Some(msg) => format!("{e}\n{msg}"),
+                    None => e,
+                })
+            }
         }
     }
 }
@@ -299,35 +427,35 @@ pub fn handle_cli(arg: &str) -> bool {
     let title = menu_title();
     match arg {
         "--register" => {
-            let text = match register_verbs() {
-                Ok(()) => {
-                    log_line("注册成功");
-                    let mut text = format!(
-                        "注册成功！\n\n右键文件 → 「{title}」\n- Windows 10：菜单第一层直接可见\n- Windows 11：在「显示更多选项」中"
-                    );
-                    if is_windows_11() {
-                        text.push_str(
-                            "\n\n要把条目放进 Win11 新版菜单第一层，请在项目目录运行 install.bat（稀疏包注册，免管理员，需已开启开发者模式）。",
-                        );
-                    }
-                    text
+            let text = match register_context_menu() {
+                RegisterResult::Ok if is_windows_11() => format!(
+                    "注册成功！\n\n右键文件 → 「{title}」\n- 新版菜单第一层直接可见\n- 经典菜单（显示更多选项）中同样可见"
+                ),
+                RegisterResult::Ok => {
+                    format!("注册成功！\n\n右键文件 → 「{title}」，菜单第一层直接可见。")
                 }
-                Err(e) => {
-                    log_line(&format!("注册失败: {e}"));
-                    format!("注册失败：\n{e}")
+                RegisterResult::Partial(e) => {
+                    format!("传统动词注册成功，但 Win11 新菜单稀疏包注册失败：\n{e}")
                 }
+                RegisterResult::Failed(e) => format!("注册失败：\n{e}"),
             };
             msg_box(&text);
             true
         }
         "--unregister" => {
-            let text = match unregister_verbs() {
+            let mut text = match unregister_verbs() {
                 Ok(()) => {
                     log_line("已取消注册");
                     "已取消注册，右键菜单项已删除。".to_string()
                 }
                 Err(e) => format!("取消注册失败：\n{e}"),
             };
+            if is_windows_11() {
+                match unregister_sparse_package() {
+                    Ok(()) => text.push_str("\nWin11 新版菜单稀疏包已移除。"),
+                    Err(e) => text.push_str(&format!("\nWin11 新版菜单稀疏包移除失败：{e}")),
+                }
+            }
             msg_box(&text);
             true
         }

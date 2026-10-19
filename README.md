@@ -108,7 +108,7 @@ cargo build --release
 # 产物：target/release/hieditor-pro.exe（GUI）与 hieditor-cli.exe（命令行）
 ```
 
-或直接使用发布包 `dist/HiEditorPro-v*.zip`（含两个 exe + 右键菜单安装脚本 + README，无安装器）。
+或直接使用发布包 `dist/HiEditorPro-v*.zip`（含两个 exe + 右键菜单注册文件 + README，无安装器）。
 
 ## 🖥️ GUI 使用
 
@@ -119,17 +119,21 @@ hieditor-pro                     # 空窗口，可拖入文件或 Ctrl+O 打开
 
 ## 🖱️ 右键菜单集成
 
-解压发布包后运行 **`install.bat`**（免管理员、可重复执行），即可把
-「用 HiEditor Pro 打开」注册进资源管理器右键菜单：
+运行 **`hieditor-pro --register`**（免管理员、可重复执行），或在程序内
+**设置 → 注册右键菜单打开**，即可把「用 HiEditor Pro 打开」注册进资源管理器右键菜单：
 
 - **Windows 11**：新版右键菜单第一层直接可见（稀疏 MSIX 包 + IExplorerCommand
-  COM 组件；需系统已开启开发者模式，或以管理员导入自签证书后签名部署）
+  COM 组件），经典菜单（显示更多选项）中显示的是同一条目、不会重复。发行包内置
+  自签名稀疏包：首次注册时在 UAC 弹窗确认一次（把签名证书导入本机受信任存储），
+  之后无需开发者模式、无需管理员。开发布局或注册失败时回退注册传统动词（仅经典
+  菜单可见；未签名注册需系统开启开发者模式）
 - **Windows 10**：右键菜单第一层直接可见（HKCU 静态动词）
-- 多选文件一次打开：每个文件一个标签页；卸载运行 `uninstall.bat`
-- 也可以在程序内操作：**设置 → 注册右键菜单打开**，一键完成上述注册
+- 多选文件一次打开：每个文件一个标签页
+- 卸载运行 `hieditor-pro --unregister`（同时移除 Win11 稀疏包）
 - 排查日志：`%TEMP%\hieditor_menu.log`（COM 组件）、`%TEMP%\hieditor_pro.log`（主程序参数）
 
-实现细节与踩坑清单见 [CONTEXT-MENU-CHECKLIST.md](CONTEXT-MENU-CHECKLIST.md)。
+两套机制的编译产物、注册流程、删除注册步骤与错误码排查的完整说明见
+[docs/CONTEXT-MENU.md](docs/CONTEXT-MENU.md)。
 
 常用快捷键：
 
