@@ -66,11 +66,17 @@ jobs:
       - name: 编译 release
         run: cargo build --release -p hieditor-gui
 
-      # CI 上没有 gitignore 掉的 signing\hieditor-signing.pfx，现场生成自签证书
-      # （CN=HiEditorPro 与 sparse\AppxManifest.xml 的 Identity@Publisher 一致）
-      - name: 生成签名证书
+      # 还原固定签名证书：pfx 已 gitignore 不入库，由仓库 Secret SIGNING_PFX（pfx 的 Base64）注入，
+      # 本地与 CI 用同一张证书，版本间不变；更换证书 = 重跑 signing\reset-signing-cert.ps1 后更新该 Secret
+      - name: 还原固定签名证书
+        env:
+          SIGNING_PFX: ${{ secrets.SIGNING_PFX }}
         shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File signing/create-signing-cert.ps1
+        run: |
+          if (-not $env:SIGNING_PFX) { throw '缺少仓库 Secret SIGNING_PFX（signing/hieditor-signing.pfx 的 Base64 内容）' }
+          [IO.File]::WriteAllBytes('signing/hieditor-signing.pfx', [Convert]::FromBase64String($env:SIGNING_PFX))
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('signing/hieditor-signing.pfx', 'hieditor-signing')
+          "已还原固定证书: $($cert.Thumbprint)（有效至 $($cert.NotAfter)）"
 
       # 复刻 package.bat：暂存目录 → exe/README/dll + sparse 清单与图标 → 签名 msix → 压缩 zip
       # 与 package.bat 的差异：签名失败此处直接失败——CI 宁可阻断发布，也不无声发布

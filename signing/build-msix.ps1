@@ -4,7 +4,7 @@
 #       -ManifestDir <含 AppxManifest.xml 与 assets\ 的目录> `
 #       -OutMsix <输出 .msix 路径> -CertOut <输出 .cer 路径>
 # 依赖：Windows SDK 的 makeappx.exe / signtool.exe；signing\hieditor-signing.pfx
-#       （缺失时先运行 signing\create-signing-cert.ps1）
+#       （固定证书，缺失时先运行 signing\create-signing-cert.ps1；更换用 reset-signing-cert.ps1）
 
 param(
     [Parameter(Mandatory = $true)] [string] $ManifestDir,
@@ -14,10 +14,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $pfx = Join-Path $PSScriptRoot 'hieditor-signing.pfx'
-$cer = Join-Path $PSScriptRoot 'hieditor-signing.cer'
 if (-not (Test-Path $pfx)) {
     throw "缺少签名证书 $pfx，请先运行 signing\create-signing-cert.ps1"
 }
+# .cer 直接从 pfx 派生，保证与签名证书一致（不依赖仓库里的 cer 副本）
+$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($pfx, 'hieditor-signing')
 
 # 定位 Windows SDK 工具（取版本号最高的 x64 目录）
 $bin = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Directory -ErrorAction SilentlyContinue |
@@ -41,8 +42,8 @@ try {
     & (Join-Path $bin 'signtool.exe') sign /fd SHA256 /f $pfx /p 'hieditor-signing' $OutMsix | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "signtool 签名失败（exit $LASTEXITCODE）" }
 
-    Copy-Item $cer $CertOut
-    Write-Output "已生成签名稀疏包：$OutMsix"
+    [IO.File]::WriteAllBytes($CertOut, $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    Write-Output "已生成签名稀疏包：$OutMsix（证书 $($cert.Thumbprint)）"
 } finally {
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
 }

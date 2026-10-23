@@ -28,9 +28,11 @@
 | `sparse\assets\*.png` | 版本管理 | 清单引用的菜单/磁贴图标 |
 | `sparse\HiEditorProContextMenu.msix` | 构建产物（gitignore） | 已签名的稀疏包（只含清单+图标，31 KB 左右） |
 | `sparse\HiEditorPro.cer` | 构建产物（gitignore） | 签名证书公钥，随发行包分发用于信任导入 |
-| `signing\hieditor-signing.pfx` | 本地私有（gitignore） | 自签代码签名证书私钥，勿入库勿外传 |
-| `signing\hieditor-signing.cer` | 版本管理 | 对应公钥证书（构建脚本从这里复制进发行包） |
-| `signing\create-signing-cert.ps1` | 版本管理 | 一次性生成自签证书（CN=HiEditorPro，10 年有效期） |
+| `signing\hieditor-signing.pfx` | 本地私有（gitignore） | **固定签名证书**（唯一来源），勿入库勿外传；CI 经 GitHub Secret `SIGNING_PFX` 注入同一文件 |
+| `signing\hieditor-signing.pfx.b64` | 本地私有（gitignore） | pfx 的 Base64，用于填写 GitHub Secret |
+| `signing\hieditor-signing.cer` | 版本管理 | 当前证书的公钥存档（发行包里的 `.cer` 由 build-msix.ps1 从 pfx 派生，不依赖此副本） |
+| `signing\create-signing-cert.ps1` | 版本管理 | 首次初始化固定证书（CN=HiEditorPro，10 年有效期；已有 pfx 时跳过） |
+| `signing\reset-signing-cert.ps1` | 版本管理 | 生成新证书覆盖 pfx/.cer（旧证书作废，需同步提交 cer 并更新 Secret） |
 | `signing\build-msix.ps1` | 版本管理 | MakeAppx 打包 + SignTool 签名 |
 | `target\release\HiEditorPro.exe` | 编译产物 | 主程序；清单 `Executable` 指向它，菜单用它启动并显示图标 |
 | `target\release\hieditor_menu.dll` | 编译产物 | IExplorerCommand 进程内 COM 组件（com:SurrogateServer，跑在 dllhost 代理进程里） |
@@ -55,13 +57,17 @@ COM 组件的 `IExplorerCommand::GetIcon`（返回「exe 完整路径,0」），
 ### 2.2 签名稀疏包（免开发者模式的关键）
 
 ```powershell
-# 一次性：生成自签证书（私钥出 pfx，公钥出 cer）
+# 一次性：初始化固定证书（已有 pfx 时跳过；更换证书用 reset-signing-cert.ps1 [-Force]）
 powershell -NoProfile -ExecutionPolicy Bypass -File signing\create-signing-cert.ps1
 
 # 每次出包：打包 + 签名（release.bat / package.bat 会自动调用）
 powershell -NoProfile -ExecutionPolicy Bypass -File signing\build-msix.ps1 `
     -ManifestDir sparse -OutMsix sparse\HiEditorProContextMenu.msix -CertOut sparse\HiEditorPro.cer
 ```
+
+证书为**固定证书**：`signing\hieditor-signing.pfx` 是唯一来源，本地与 CI（GitHub
+Secret `SIGNING_PFX` = pfx 的 Base64）使用同一张，所有版本签名一致，用户只需
+首次注册时信任一次。CI 侧由 workflow 从 Secret 还原 pfx，不依赖机器证书库。
 
 `build-msix.ps1` 的动作：从干净暂存目录（仅清单+图标，exe/dll 不进包）用
 `makeappx pack /o /nv /d` 打包（`/nv` 跳过清单引用文件检查），`signtool sign /fd SHA256`

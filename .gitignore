@@ -18,3 +18,4 @@ testfiles/
 /sparse/HiEditorProContextMenu.msix
 /sparse/HiEditorPro.cer
 /signing/hieditor-signing.pfx
+/signing/hieditor-signing.pfx.b64
