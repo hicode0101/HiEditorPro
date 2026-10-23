@@ -105,7 +105,7 @@ GB 级文件毫秒级打开、全文件搜索秒级完成、编辑操作与文�
 git clone <repo-url>
 cd HiEditorPro
 cargo build --release
-# 产物：target/release/hieditor-pro.exe（GUI）与 hieditor-cli.exe（命令行）
+# 产物：target/release/HiEditorPro.exe（GUI）与 hieditor-cli.exe（命令行）
 ```
 
 或直接使用发布包 `dist/HiEditorPro-v*.zip`（含两个 exe + 右键菜单注册文件 + README，无安装器）。
@@ -113,13 +113,13 @@ cargo build --release
 ## 🖥️ GUI 使用
 
 ```bash
-hieditor-pro test_5gb.log        # 命令行参数直接打开
-hieditor-pro                     # 空窗口，可拖入文件或 Ctrl+O 打开
+HiEditorPro test_5gb.log        # 命令行参数直接打开
+HiEditorPro                     # 空窗口，可拖入文件或 Ctrl+O 打开
 ```
 
 ## 🖱️ 右键菜单集成
 
-运行 **`hieditor-pro --register`**（免管理员、可重复执行），或在程序内
+运行 **`HiEditorPro --register`**（免管理员、可重复执行），或在程序内
 **设置 → 注册右键菜单打开**，即可把「用 HiEditor Pro 打开」注册进资源管理器右键菜单：
 
 - **Windows 11**：新版右键菜单第一层直接可见（稀疏 MSIX 包 + IExplorerCommand
@@ -129,7 +129,7 @@ hieditor-pro                     # 空窗口，可拖入文件或 Ctrl+O 打开
   菜单可见；未签名注册需系统开启开发者模式）
 - **Windows 10**：右键菜单第一层直接可见（HKCU 静态动词）
 - 多选文件一次打开：每个文件一个标签页
-- 卸载运行 `hieditor-pro --unregister`（同时移除 Win11 稀疏包）
+- 卸载运行 `HiEditorPro --unregister`（同时移除 Win11 稀疏包）
 - 排查日志：`%TEMP%\hieditor_menu.log`（COM 组件）、`%TEMP%\hieditor_pro.log`（主程序参数）
 
 两套机制的编译产物、注册流程、删除注册步骤与错误码排查的完整说明见

@@ -27,7 +27,7 @@
   </Dependencies>
 
   <Applications>
-    <Application Id="HiEditorProApp" Executable="hieditor-pro.exe" EntryPoint="windows.fullTrustApplication">
+    <Application Id="HiEditorProApp" Executable="HiEditorPro.exe" EntryPoint="windows.fullTrustApplication">
       <uap:VisualElements
         DisplayName="HiEditor Pro"
         Description="HiEditor Pro context menu"

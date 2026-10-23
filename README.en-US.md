@@ -113,7 +113,7 @@ Full technical analysis and measurements: [docs/ARCHITECTURE.md](docs/ARCHITECTU
 git clone <repo-url>
 cd HiEditorPro
 cargo build --release
-# Outputs: target/release/hieditor-pro.exe (GUI) and hieditor-cli.exe (CLI)
+# Outputs: target/release/HiEditorPro.exe (GUI) and hieditor-cli.exe (CLI)
 ```
 
 Alternatively grab `dist/HiEditorPro-v*.zip` (two executables + context-menu registration files + README, no installer).
@@ -121,13 +121,13 @@ Alternatively grab `dist/HiEditorPro-v*.zip` (two executables + context-menu reg
 ## 🖥️ GUI
 
 ```bash
-hieditor-pro test_5gb.log        # open from command line
-hieditor-pro                     # empty window; drag a file in or press Ctrl+O
+HiEditorPro test_5gb.log        # open from command line
+HiEditorPro                     # empty window; drag a file in or press Ctrl+O
 ```
 
 ## 🖱️ Explorer Context Menu
 
-Run **`hieditor-pro --register`** (no admin required, idempotent), or use
+Run **`HiEditorPro --register`** (no admin required, idempotent), or use
 **Settings → Register context menu** in the app, to register "Open with HiEditor Pro"
 in the Explorer context menu:
 
@@ -141,7 +141,7 @@ in the Explorer context menu:
   requires Developer Mode
 - **Windows 10**: shown at the first level of the classic menu (HKCU static verb)
 - Multi-select opens one tab per file
-- Run `hieditor-pro --unregister` to remove (also removes the Win11 sparse package)
+- Run `HiEditorPro --unregister` to remove (also removes the Win11 sparse package)
 - Troubleshooting logs: `%TEMP%\hieditor_menu.log` (COM server), `%TEMP%\hieditor_pro.log` (app args)
 
 See [docs/CONTEXT-MENU.md](docs/CONTEXT-MENU.md) for build artifacts, the full

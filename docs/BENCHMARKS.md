@@ -109,7 +109,7 @@ cargo bench -p hieditor-bench   # criterion 基准（256MB，target/testfiles �
 hieditor-cli info  testfiles/test_5gb.log
 hieditor-cli open  testfiles/test_5gb.log
 hieditor-cli search testfiles/test_5gb.log alpha --show 20   # ANSI 高亮
-hieditor-pro    testfiles/test_5gb.log                       # GUI 预览：虚拟化浏览 + 关键词高亮
+HiEditorPro    testfiles/test_5gb.log                       # GUI 预览：虚拟化浏览 + 关键词高亮
 ```
 
 ## 七、已知限制

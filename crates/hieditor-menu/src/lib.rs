@@ -32,9 +32,9 @@ const CLSID_HIEDITOR_COMMAND: GUID = GUID::from_u128(0x2E7EED97_9BAE_4334_8DA1_8
 const MENU_TITLE: &str = "用 HiEditor Pro 打开";
 const MENU_TOOLTIP: &str = "用 HiEditor Pro 打开选中的文件";
 
-/// 主程序候选名：统一为 hieditor-pro.exe（hieditor-gui.exe 为旧版兼容回退），
+/// 主程序候选名：统一为 HiEditorPro.exe（hieditor-gui.exe 为旧版兼容回退），
 /// 取第一个与 DLL 同目录存在者（不写死绝对路径，随安装位置迁移）
-const EXE_CANDIDATES: [&str; 2] = ["hieditor-pro.exe", "hieditor-gui.exe"];
+const EXE_CANDIDATES: [&str; 2] = ["HiEditorPro.exe", "hieditor-gui.exe"];
 
 #[no_mangle]
 pub extern "system" fn DllGetClassObject(

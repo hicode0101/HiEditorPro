@@ -3,8 +3,9 @@
 #   同步为 tag 版本（程序"关于"里的版本号取自编译期 CARGO_PKG_VERSION，随之一致），
 #   打包 HiEditorPro-v{tag版本}.zip 并自动发布到 GitHub Release
 # - 手动触发（workflow_dispatch）：按 Cargo.toml 版本编译打包，上传 Artifacts
-# 产物：HiEditorPro-v{版本}.zip，内含 hieditor-pro.exe 与右键菜单安装文件
-#       （install.bat / uninstall.bat / hieditor_menu.dll / sparse\ 稀疏包脚本）
+# 产物：HiEditorPro-v{版本}.zip，内含 HiEditorPro.exe / README.md / hieditor_menu.dll
+#       与 sparse\ 稀疏包注册文件（AppxManifest.xml + 图标 + 签名 msix/.cer）；
+#       注册走 HiEditorPro --register 或 GUI 设置（签名包免开发者模式，证书导入弹一次 UAC）
 
 name: Package
 
@@ -61,26 +62,40 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # 只编译 GUI 及其依赖（产物只需要 GUI 的 exe），速度更快
-      # （crate 名为 hieditor-gui，二进制产物为 hieditor-pro.exe）
+      # （crate 名为 hieditor-gui，二进制产物为 HiEditorPro.exe）
       - name: 编译 release
         run: cargo build --release -p hieditor-gui
 
-      # 复刻 package.bat：暂存目录 → 复制 exe/dll + 右键菜单安装文件 → 压缩 zip
+      # CI 上没有 gitignore 掉的 signing\hieditor-signing.pfx，现场生成自签证书
+      # （CN=HiEditorPro 与 sparse\AppxManifest.xml 的 Identity@Publisher 一致）
+      - name: 生成签名证书
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File signing/create-signing-cert.ps1
+
+      # 复刻 package.bat：暂存目录 → exe/README/dll + sparse 清单与图标 → 签名 msix → 压缩 zip
+      # 与 package.bat 的差异：签名失败此处直接失败——CI 宁可阻断发布，也不无声发布
+      # 需要开发者模式的未签名降级包
       - name: 打包
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $exe = 'target/release/hieditor-pro.exe'
+          $exe = 'target/release/HiEditorPro.exe'
           $dll = 'target/release/hieditor_menu.dll'
           if (-not (Test-Path $exe)) { throw "未找到 $exe" }
           if (-not (Test-Path $dll)) { throw "未找到 $dll" }
           $dist = "HiEditorPro-v${{ steps.ver.outputs.version }}"
           New-Item -ItemType Directory -Force -Path "dist/$dist/sparse/assets" | Out-Null
           Copy-Item $exe "dist/$dist/"
+          Copy-Item README.md "dist/$dist/"
           Copy-Item $dll "dist/$dist/"
-          Copy-Item install.bat, uninstall.bat "dist/$dist/"
-          Copy-Item sparse/AppxManifest.xml, sparse/setup-sparse.ps1 "dist/$dist/sparse/"
+          Copy-Item sparse/AppxManifest.xml "dist/$dist/sparse/"
           Copy-Item sparse/assets/Square150x150Logo.png, sparse/assets/Square44x44Logo.png "dist/$dist/sparse/assets/"
+          # 签名稀疏包：makeappx 只打清单与图标，exe/dll 经 -ExternalLocation 外挂，不进包
+          pwsh -NoProfile -ExecutionPolicy Bypass -File signing/build-msix.ps1 `
+            -ManifestDir "dist/$dist/sparse" `
+            -OutMsix "dist/$dist/sparse/HiEditorProContextMenu.msix" `
+            -CertOut "dist/$dist/sparse/HiEditorPro.cer"
+          if ($LASTEXITCODE -ne 0) { throw "签名稀疏包构建失败（缺 Windows SDK 的 makeappx/signtool 或签名证书）" }
           Compress-Archive -Path "dist/$dist/*" -DestinationPath "dist/$dist.zip" -Force
           Get-Item "dist/$dist.zip" | ForEach-Object { "产物: $($_.Name) ($($_.Length) 字节)" }
 

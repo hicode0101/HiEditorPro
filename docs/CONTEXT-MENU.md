@@ -32,7 +32,7 @@
 | `signing\hieditor-signing.cer` | 版本管理 | 对应公钥证书（构建脚本从这里复制进发行包） |
 | `signing\create-signing-cert.ps1` | 版本管理 | 一次性生成自签证书（CN=HiEditorPro，10 年有效期） |
 | `signing\build-msix.ps1` | 版本管理 | MakeAppx 打包 + SignTool 签名 |
-| `target\release\hieditor-pro.exe` | 编译产物 | 主程序；清单 `Executable` 指向它，菜单用它启动并显示图标 |
+| `target\release\HiEditorPro.exe` | 编译产物 | 主程序；清单 `Executable` 指向它，菜单用它启动并显示图标 |
 | `target\release\hieditor_menu.dll` | 编译产物 | IExplorerCommand 进程内 COM 组件（com:SurrogateServer，跑在 dllhost 代理进程里） |
 
 注册/运行后在 `sparse\`（或发行包解压目录）产生的运行数据：
@@ -47,7 +47,7 @@
 rebuild.bat            :: 即 cargo build --release --workspace
 ```
 
-产物 `hieditor-pro.exe`（GUI）与 `hieditor_menu.dll`。图标显示链路：新版菜单调用
+产物 `HiEditorPro.exe`（GUI）与 `hieditor_menu.dll`。图标显示链路：新版菜单调用
 COM 组件的 `IExplorerCommand::GetIcon`（返回「exe 完整路径,0」），经典菜单动词读
 注册表 `Icon` 值（同样是 exe,0）——两者都要求 **exe 旁边能找到主程序** 且 exe 带
 内嵌图标资源（由 `build.rs` 的 winresource 嵌入）。
@@ -74,7 +74,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File signing\build-msix.ps1 `
 
 ## 3. 注册
 
-入口二选一：`hieditor-pro --register`，或 GUI 内 **设置 → 注册右键菜单打开**
+入口二选一：`HiEditorPro --register`，或 GUI 内 **设置 → 注册右键菜单打开**
 （内部同走 `register_context_menu()`）。免管理员、可重复执行、随目录迁移。
 
 ### 3.1 Win11 稀疏包注册（主路径）
@@ -124,7 +124,7 @@ exe 旁 `sparse\` 没有 `.msix`（例如只跑过 `cargo build`）时，走
 
 ## 4. 删除注册
 
-`hieditor-pro --unregister`（幂等，未注册项不报错）：
+`HiEditorPro --unregister`（幂等，未注册项不报错）：
 
 1. 删传统动词键：`RegDeleteTreeW(HKCU\Software\Classes\*\shell\HiEditorPro)`。
 2. 删辅助 CLSID 键：`RegDeleteTreeW(HKCU\Software\Classes\CLSID\{2E7EED97-…})`。

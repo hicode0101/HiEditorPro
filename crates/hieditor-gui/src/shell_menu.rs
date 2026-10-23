@@ -48,7 +48,7 @@ const CLSID_BRACED: &str = "{2E7EED97-9BAE-4334-8DA1-8DE129DA7024}";
 const SIGNED_PACKAGE_FILE: &str = "HiEditorProContextMenu.msix";
 const SIGNED_CERT_FILE: &str = "HiEditorPro.cer";
 /// 签名包清单声明的可执行文件名（签名后不可改，ExternalLocation 内必须同名）
-const MANIFEST_EXE: &str = "hieditor-pro.exe";
+const MANIFEST_EXE: &str = "HiEditorPro.exe";
 
 /// GUI 进程无控制台，子进程默认闪现新窗口；此标志让子进程静默运行
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -193,7 +193,7 @@ fn locate_sparse_dir() -> Option<PathBuf> {
     cands.into_iter().find(|c| c.join("AppxManifest.xml").is_file())
 }
 
-/// 把清单 Application@Executable 改成实际 exe 文件名（发行包里 exe 可能叫 hieditor-pro.exe）
+/// 把清单 Application@Executable 改成实际 exe 文件名（如发行包内 exe 与清单不一致）
 fn patch_manifest_executable(xml: &str, exe_name: &str) -> String {
     const KEY: &str = "Executable=\"";
     let Some(start) = xml.find(KEY) else { return xml.to_string() };

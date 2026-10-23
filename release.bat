@@ -11,7 +11,7 @@ where cargo >nul 2>nul
 if errorlevel 1 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
 
 rem --- abort if the app is running (exe cannot be overwritten) ---
-tasklist 2>nul | findstr /i "hieditor-pro.exe" >nul
+tasklist 2>nul | findstr /i "HiEditorPro.exe" >nul
 if not errorlevel 1 (
     echo *** HiEditor Pro is running, please close it before packaging ***
     exit /b 1
@@ -32,11 +32,11 @@ if exist "%STAGE%" rmdir /s /q "%STAGE%"
 if exist "%~dp0dist\%DIST%.zip" del /q "%~dp0dist\%DIST%.zip"
 mkdir "%STAGE%" 2>nul
 
-copy /y "%~dp0target\release\hieditor-pro.exe" "%STAGE%" >nul || goto :fail
+copy /y "%~dp0target\release\HiEditorPro.exe" "%STAGE%" >nul || goto :fail
 copy /y "%~dp0target\release\hieditor-cli.exe" "%STAGE%" >nul || goto :fail
 copy /y "%~dp0README.md" "%STAGE%" >nul || goto :fail
 
-rem --- context-menu registration files (hieditor-pro --register:
+rem --- context-menu registration files (HiEditorPro --register:
 rem     classic verb + Win11 signed sparse package) ---
 copy /y "%~dp0target\release\hieditor_menu.dll" "%STAGE%" >nul || goto :fail
 mkdir "%STAGE%\sparse\assets" 2>nul
@@ -57,8 +57,8 @@ if errorlevel 1 goto :fail
 echo === [4/4] Done ===
 for %%A in ("%~dp0dist\%DIST%.zip") do echo   Output: %DIST%.zip ^(%%~zA bytes^)
 echo   Location: %~dp0dist\%DIST%.zip
-echo   Contents: hieditor-pro.exe / hieditor-cli.exe / README.md / context-menu files
-echo   Register: run hieditor-pro --register (confirm UAC once for cert import)
+echo   Contents: HiEditorPro.exe / hieditor-cli.exe / README.md / context-menu files
+echo   Register: run HiEditorPro --register (confirm UAC once for cert import)
 exit /b 0
 
 :fail

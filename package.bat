@@ -6,16 +6,16 @@ rem ===== HiEditor Pro package script =====
 rem Usage: package.bat
 rem Prereq: release build done (rebuild.bat or cargo build --release)
 rem Output: dist\HiEditorPro-v1.0.0.zip
-rem         Contains hieditor-pro.exe + context-menu registration files
+rem         Contains HiEditorPro.exe + context-menu registration files
 rem         (hieditor_menu.dll / sparse\ signed package). After extracting,
-rem         run "hieditor-pro --register" or use GUI Settings to register.
+rem         run "HiEditorPro --register" or use GUI Settings to register.
 
 set "VERSION=1.0.0"
 set "DIST=HiEditorPro-v%VERSION%"
 set "STAGE=%~dp0dist\%DIST%"
 
-if not exist "%~dp0target\release\hieditor-pro.exe" (
-    echo *** target\release\hieditor-pro.exe not found, run rebuild.bat first ***
+if not exist "%~dp0target\release\HiEditorPro.exe" (
+    echo *** target\release\HiEditorPro.exe not found, run rebuild.bat first ***
     exit /b 1
 )
 if not exist "%~dp0target\release\hieditor_menu.dll" (
@@ -28,8 +28,8 @@ if exist "%STAGE%" rmdir /s /q "%STAGE%"
 if exist "%~dp0dist\%DIST%.zip" del /q "%~dp0dist\%DIST%.zip"
 mkdir "%STAGE%" 2>nul
 
-echo === [2/5] Copy hieditor-pro.exe and README ===
-copy /y "%~dp0target\release\hieditor-pro.exe" "%STAGE%" >nul || goto :fail
+echo === [2/5] Copy HiEditorPro.exe and README ===
+copy /y "%~dp0target\release\HiEditorPro.exe" "%STAGE%" >nul || goto :fail
 copy /y "%~dp0README.md" "%STAGE%" >nul || goto :fail
 
 echo === [3/5] Copy context-menu registration files ===
@@ -50,8 +50,8 @@ if errorlevel 1 goto :fail
 echo === Package done ===
 for %%A in ("%~dp0dist\%DIST%.zip") do echo   Output: %DIST%.zip ^(%%~zA bytes^)
 echo   Location: %~dp0dist\%DIST%.zip
-echo   Contents: hieditor-pro.exe / hieditor_menu.dll / README.md / sparse\
-echo   Register: run hieditor-pro --register (confirm UAC once for cert import)
+echo   Contents: HiEditorPro.exe / hieditor_menu.dll / README.md / sparse\
+echo   Register: run HiEditorPro --register (confirm UAC once for cert import)
 exit /b 0
 
 :fail
