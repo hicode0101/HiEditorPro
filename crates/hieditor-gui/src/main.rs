@@ -2852,6 +2852,14 @@ impl eframe::App for App {
                     }
                     new_rects.push((self.tabs[i].id, tab_rect));
 
+                    // 悬停提示：显示完整文件路径（含文件名）
+                    let full_path = self.tabs[i].eb.path().to_string_lossy().to_string();
+                    let tab_resp = if full_path.is_empty() {
+                        tab_resp
+                    } else {
+                        tab_resp.on_hover_text(full_path)
+                    };
+
                     // ---- Tab 右键菜单 ----
                     tab_resp.context_menu(|ui| {
                         ui.set_min_width(190.0);
