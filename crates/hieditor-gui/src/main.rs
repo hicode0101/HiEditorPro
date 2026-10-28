@@ -182,7 +182,7 @@ fn tr(lang: Lang, key: &str) -> &'static str {
         (_, "settings.ctxmenu_classic") => if zh { "传统菜单已注册，但 Win11 新菜单未注册：" } else { "Classic menu registered, but the Win11 native menu was not: " },
         (_, "settings.ctxmenu_fail") => if zh { "注册右键菜单失败：" } else { "Failed to register context menu: " },
         (_, "about.title") => if zh { "关于" } else { "About" },
-        (_, "about.src") => if zh { "开源地址" } else { "Source" },
+        (_, "about.src") => if zh { "官网" } else { "Website" },
         (_, "about.wx") => if zh { "作者微信" } else { "Author WeChat" },
         (_, "btn.open") => if zh { "打开" } else { "Open" },
         (_, "btn.copy") => if zh { "复制" } else { "Copy" },
