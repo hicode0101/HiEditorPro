@@ -16,6 +16,6 @@ testfiles/
 /sparse/recent_files.json
 /sparse/hieditor.conf
 /sparse/HiEditorProContextMenu.msix
-/sparse/HiEditorPro.cer
-/signing/hieditor-signing.pfx
-/signing/hieditor-signing.pfx.b64
+#/sparse/HiEditorPro.cer
+#/signing/hieditor-signing.pfx
+#/signing/hieditor-signing.pfx.b64
