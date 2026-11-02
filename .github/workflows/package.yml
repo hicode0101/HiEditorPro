@@ -61,10 +61,10 @@ jobs:
       - name: 缓存 Cargo 依赖
         uses: Swatinem/rust-cache@v2
 
-      # 只编译 GUI 及其依赖（产物只需要 GUI 的 exe），速度更快
-      # （crate 名为 hieditor-gui，二进制产物为 HiEditorPro.exe）
+      # 编译产物所需的两个包：hieditor-gui（HiEditorPro.exe）+ hieditor-menu（hieditor_menu.dll，
+      # 运行时加载的 cdylib，不是 gui 的依赖，必须单独 -p）
       - name: 编译 release
-        run: cargo build --release -p hieditor-gui
+        run: cargo build --release -p hieditor-gui -p hieditor-menu
 
       # 签名证书：pfx 随仓库分发；若配置了仓库 Secret SIGNING_PFX（pfx 的 Base64）则覆盖注入，
       # 本地与 CI 用同一张证书，版本间不变；更换证书 = 重跑 signing\reset-signing-cert.ps1 后提交新 pfx
